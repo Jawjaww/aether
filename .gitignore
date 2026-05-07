@@ -1,0 +1,73 @@
+# Node / package managers
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.pnpm-debug.log
+.pnpm-store/
+
+# Build / output
+dist/
+**/dist/
+build/
+**/build/
+out/
+*.tgz
+*.tsbuildinfo
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.sublime-*
+
+# Environment / secrets / logs
+.env
+.env.*
+*.local
+*.log
+
+# Caches / coverage
+.cache/
+.cache-loader/
+coverage/
+**/coverage/
+.nyc_output/
+
+# DB / large artifacts
+*.sqlite
+*.sqlite3
+*.db
+.lancedb/
+
+# Large model files (ignore model binaries, keep metadata)
+onnx-bge-reranker-v2-m3/onnx/
+onnx-bge-reranker-v2-m3/*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# Misc / editor temp files
+*.swp
+*.swo
+*~
+*.lock
+*.bak
+
+# Misc tooling
+*.log
+Dockerfile.*
+docker-compose.override.yml
