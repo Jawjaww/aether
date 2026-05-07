@@ -1,0 +1,2 @@
+- [x] Fix useAuth null session handling
+- [ ] Add refreshToken error boundary

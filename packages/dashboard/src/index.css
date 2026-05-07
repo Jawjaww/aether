@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #09090b; /* Zinc 950 */
+  color: #fafafa; /* Zinc 50 */
+}
