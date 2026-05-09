@@ -653,13 +653,24 @@ const rerankCandidates = async (
     return { candidates, rerankTime, rerankFallback: true };
   }
 
-  const finalCandidates = rerankResponse.results
+  const SCORE_THRESHOLD = 0.3;
+  const MIN_CANDIDATES = 2;
+
+  const scored = rerankResponse.results
     .map((result) => {
       const candidate = candidates[result.index];
       if (candidate) return { ...candidate, score: result.score };
       return null;
     })
     .filter((c): c is RerankCandidate => c !== null);
+
+  // Sort by descending score
+  scored.sort((a, b) => b.score - a.score);
+
+  // Qualitative threshold + guaranteed fallback
+  const finalCandidates = scored.filter(c => c.score >= SCORE_THRESHOLD).length >= MIN_CANDIDATES
+    ? scored.filter(c => c.score >= SCORE_THRESHOLD)
+    : scored.slice(0, MIN_CANDIDATES);
 
   return { candidates: finalCandidates, rerankTime, rerankFallback: false };
 };

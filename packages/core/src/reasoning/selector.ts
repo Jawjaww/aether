@@ -196,6 +196,9 @@ export const initSelector = (projectHash: string): void => {
   if (!columnNames.includes('confidence')) {
     db.exec(`ALTER TABLE telemetry ADD COLUMN confidence REAL;`);
   }
+  if (!columnNames.includes('budgetTokens')) {
+    db.exec(`ALTER TABLE telemetry ADD COLUMN budgetTokens INTEGER;`);
+  }
 };
 
 export const recordTelemetry = (

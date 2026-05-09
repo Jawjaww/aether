@@ -348,7 +348,7 @@ const requestAetherContext = (
     const timeout = setTimeout(() => {
       socket.destroy();
       resolve(null);
-    }, 3000);
+    }, 15000);
 
     const payload = JSON.stringify({
       id: `gw-${Date.now()}`,
@@ -845,8 +845,9 @@ const forwardToOllama = async (
       const genTime = (Date.now() - tFirstToken) / 1000;
       lastStats.tps = genTime > 0.01 ? Math.round(tokenCount / genTime) : 0;
       if (aetherCtx) {
-        lastStats.astTime = aetherCtx.meta?.astTime || 0;
-        lastStats.ragTime = aetherCtx.meta?.ragTime || 0;
+        // astTime is already measured around requestAetherContext call.
+        // ragTime is included in astTime for now.
+        lastStats.ragTime = 0;
         lastStats.rerankTime = aetherCtx.meta?.rerankTime || 0;
         console.log(
           `[Gateway] [Aether] AST: ${lastStats.astTime}ms, RAG: ${lastStats.ragTime}ms, Rerank: ${lastStats.rerankTime}ms`
@@ -935,28 +936,46 @@ fastify.post("/v1/chat/completions", async (request, reply: any) => {
   
   const configPath = path.join(os.homedir(), ".aether", "config.json");
   const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : {};
-  const isBypass = config.bypassAether === true;
+  const isBypass = config.bypassAether === true 
+    || (request.headers as Record<string, string>)['x-aether-bypass'] === 'full'
+    || (body as any).__aether_bypass === true;
 
+  // ─── BYPASS MODE ─────────────────────────────────────────────────────────
   if (isBypass) {
     stats.aetherBypass++;
+    const tokensRaw = await countTokensForMessages(messages, modelName);
+    lastStats = { 
+      astTime: 0, ragTime: 0, ttft: 0, tps: 0, totalTokens: 0,
+      totalTime: 0, tokensRaw, tokensBefore: tokensRaw, rerankTime: 0 
+    };
+    try {
+      reply.hijack();
+      const forwardPayload: Record<string, unknown> = { ...body, messages, stream, keep_alive: -1 };
+      if (!tools) delete forwardPayload.tools;
+      await forwardToOllama(forwardPayload, reply as unknown, t0, null);
+    } finally {
+      stats.currentRequestStart = null;
+      recordRequest({
+        ok: true, latencyMs: Date.now() - t0,
+        tokensRaw, tokensBefore: tokensRaw, tokensAfter: tokensRaw,
+        toolsBefore: tools?.length ?? 0, toolsAfter: tools?.length ?? 0,
+        bypass: true,
+      });
+    }
+    return;
   }
 
+  // ─── PIPELINE NORMAL ───────────────────────────────────────────────────────
   const taskText = extractTaskText(messages);
-  const ctxResult = isBypass 
-    ? { messages, tokensRaw: 0, tokensEngineered: 0, blocksDropped: 0, blockTypesSummary: "", activeFilePath: undefined, cursorLine: undefined }
-    : engineerContext(messages);
+  const ctxResult = engineerContext(messages);
     
   const strippedMessages = ctxResult.messages;
-  const shapedTools = isBypass ? tools : shapeTools(tools, taskText);
+  const shapedTools = shapeTools(tools, taskText);
 
-  if (!isBypass) {
-    console.log(
-      `[ctx-engine] raw=${ctxResult.tokensRaw}tok → engineered=${ctxResult.tokensEngineered}tok ` +
-      `(dropped ${ctxResult.blocksDropped} blocks: ${ctxResult.blockTypesSummary})`
-    );
-  } else {
-    console.log(`[ctx-engine] Bypass active — raw request forwarded directly to model.`);
-  }
+  console.log(
+    `[ctx-engine] raw=${ctxResult.tokensRaw}tok → engineered=${ctxResult.tokensEngineered}tok ` +
+    `(dropped ${ctxResult.blocksDropped} blocks: ${ctxResult.blockTypesSummary})`
+  );
 
   // tokensBefore = post-engineering, pre-Aether-injection
   const tokensBefore = await countTokensForMessages(strippedMessages, modelName);
@@ -981,7 +1000,7 @@ fastify.post("/v1/chat/completions", async (request, reply: any) => {
     reply.hijack();
     
     let aetherCtx = null;
-    if (!isBypass && taskText) {
+    if (taskText) {
       const tContext_start = Date.now();
       aetherCtx = await requestAetherContext(taskText, ctxResult.activeFilePath, ctxResult.cursorLine);
       lastStats.astTime = Date.now() - tContext_start;
@@ -1028,7 +1047,7 @@ fastify.post("/v1/chat/completions", async (request, reply: any) => {
       tokensAfter,
       toolsBefore: tools?.length ?? 0,
       toolsAfter: shapedTools?.length ?? tools?.length ?? 0,
-      bypass: isBypass,
+      bypass: false,
     });
   }
 });
@@ -1185,9 +1204,24 @@ fastify.get("/aether/engine/status", async () => {
   return { status: engineStatus };
 });
 
+const killPort = (port: number): Promise<void> =>
+  new Promise((resolve) => {
+    // macOS/Linux : lsof trouve le PID, kill -9 le tue
+    const child = spawn("sh", ["-c", `lsof -ti:${port} | xargs kill -9 2>/dev/null || true`]);
+    child.on("close", () => resolve());
+    child.on("error", () => resolve()); // non-fatal
+  });
+
 fastify.post("/aether/engine/start", async () => {
   if (engineStatus !== "stopped") return { status: engineStatus };
   engineStatus = "starting";
+
+  // ─── Nettoyage préventif des ports zombies ────────────────────────────────
+  addLog("[System] Cleaning up zombie processes on ports 8081, 8082...");
+  await Promise.all([killPort(8081), killPort(8082)]);
+  await new Promise(r => setTimeout(r, 500)); // laisser l'OS libérer les sockets
+  addLog("[System] Ports cleared.");
+  // ─────────────────────────────────────────────────────────────────────────
   
   const config = fs.existsSync(CONFIG_PATH) ? JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) : {};
   const modelPath = config.modelPath || "/Users/beij/models/Qwen3.6-35B-A3B-RotorQuant-MLX-8bit";
