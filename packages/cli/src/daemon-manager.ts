@@ -247,6 +247,7 @@ export const stop = (projectRoot: string): void => {
   try {
     killProcessesOnPort(8080, true);
     killProcessesOnPort(8081, true);
+    killProcessesOnPort(8082, true);
   } catch {
     // best-effort — ignore failures
   }

@@ -73,6 +73,28 @@ const waitForHttpReady = async (
   return false;
 };
 
+const waitForSocket = async (
+  sockPath: string,
+  timeoutMs: number,
+  intervalMs: number,
+): Promise<boolean> => {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (fs.existsSync(sockPath)) {
+      // The socket file exists, but we must verify the daemon is actually listening
+      // otherwise it might be an orphaned socket from a previous crash.
+      const status = await requestAetherDaemonStatus();
+      if (status !== null) {
+        return true;
+      }
+    }
+    await sleep(intervalMs);
+  }
+
+  return false;
+};
+
 // ─── In-memory Stats ──────────────────────────────────────────────────────────
 
 interface Stats {
@@ -643,7 +665,10 @@ const engineerContext = (
     }
 
     tokensEngineered += estimateBlockTokens(finalContent);
-    return { msg: { ...msg, content: finalContent }, keep: true, content: finalContent };
+    // To enable Prefix Caching in MLX, only keep the 'persona' block as 'system'.
+    // Convert all other environment/context blocks to 'user' messages.
+    const role = block.type === 'persona' ? 'system' : 'user';
+    return { msg: { ...msg, role, content: finalContent }, keep: true, content: finalContent };
   });
 
   const filteredMessages = processedMessages
@@ -686,7 +711,7 @@ const injectAetherContext = (
   if (parts.length === 0) return messages;
 
   const aetherMsg = {
-    role: "system",
+    role: "user",
     content: parts.join("\n"),
   };
 
@@ -786,7 +811,7 @@ const forwardToOllama = async (
     lastStats.totalTime = (Date.now() - tStart) / 1000;
     if (tFirstToken > 0) {
       const genTime = (Date.now() - tFirstToken) / 1000;
-      lastStats.tps = genTime > 0.1 ? Math.round(tokenCount / genTime) : 0;
+      lastStats.tps = genTime > 0.01 ? Math.round(tokenCount / genTime) : 0;
     }
   };
 
@@ -818,7 +843,7 @@ const forwardToOllama = async (
     lastStats.tokensBefore = lastStats.tokensBefore || 0;
     if (tFirstToken > 0) {
       const genTime = (Date.now() - tFirstToken) / 1000;
-      lastStats.tps = genTime > 0.1 ? Math.round(tokenCount / genTime) : 0;
+      lastStats.tps = genTime > 0.01 ? Math.round(tokenCount / genTime) : 0;
       if (aetherCtx) {
         lastStats.astTime = aetherCtx.meta?.astTime || 0;
         lastStats.ragTime = aetherCtx.meta?.ragTime || 0;
@@ -906,17 +931,33 @@ fastify.post("/v1/chat/completions", async (request, reply: any) => {
   const tools = body.tools as unknown[] | undefined;
   const stream = body.stream !== false;
 
-  const taskText = extractTaskText(messages);
-  const ctxResult = engineerContext(messages);
-  const strippedMessages = ctxResult.messages;
-  const shapedTools = shapeTools(tools, taskText);
-
-  console.log(
-    `[ctx-engine] raw=${ctxResult.tokensRaw}tok → engineered=${ctxResult.tokensEngineered}tok ` +
-    `(dropped ${ctxResult.blocksDropped} blocks: ${ctxResult.blockTypesSummary})`
-  );
-
   const modelName = (body.model as string | undefined) ?? undefined;
+  
+  const configPath = path.join(os.homedir(), ".aether", "config.json");
+  const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : {};
+  const isBypass = config.bypassAether === true;
+
+  if (isBypass) {
+    stats.aetherBypass++;
+  }
+
+  const taskText = extractTaskText(messages);
+  const ctxResult = isBypass 
+    ? { messages, tokensRaw: 0, tokensEngineered: 0, blocksDropped: 0, blockTypesSummary: "", activeFilePath: undefined, cursorLine: undefined }
+    : engineerContext(messages);
+    
+  const strippedMessages = ctxResult.messages;
+  const shapedTools = isBypass ? tools : shapeTools(tools, taskText);
+
+  if (!isBypass) {
+    console.log(
+      `[ctx-engine] raw=${ctxResult.tokensRaw}tok → engineered=${ctxResult.tokensEngineered}tok ` +
+      `(dropped ${ctxResult.blocksDropped} blocks: ${ctxResult.blockTypesSummary})`
+    );
+  } else {
+    console.log(`[ctx-engine] Bypass active — raw request forwarded directly to model.`);
+  }
+
   // tokensBefore = post-engineering, pre-Aether-injection
   const tokensBefore = await countTokensForMessages(strippedMessages, modelName);
 
@@ -938,9 +979,13 @@ fastify.post("/v1/chat/completions", async (request, reply: any) => {
 
   try {
     reply.hijack();
-    const tContext_start = Date.now();
-    const aetherCtx = taskText ? await requestAetherContext(taskText, ctxResult.activeFilePath, ctxResult.cursorLine) : null;
-    lastStats.astTime = Date.now() - tContext_start;
+    
+    let aetherCtx = null;
+    if (!isBypass && taskText) {
+      const tContext_start = Date.now();
+      aetherCtx = await requestAetherContext(taskText, ctxResult.activeFilePath, ctxResult.cursorLine);
+      lastStats.astTime = Date.now() - tContext_start;
+    }
     
     const enrichedMessages = aetherCtx
       ? injectAetherContext(strippedMessages, aetherCtx)
@@ -983,7 +1028,7 @@ fastify.post("/v1/chat/completions", async (request, reply: any) => {
       tokensAfter,
       toolsBefore: tools?.length ?? 0,
       toolsAfter: shapedTools?.length ?? tools?.length ?? 0,
-      bypass: false,
+      bypass: isBypass,
     });
   }
 });
@@ -1176,7 +1221,7 @@ fastify.post("/aether/engine/start", async () => {
 
   console.log("[Engine] Starting Reranker Server...");
   addLog("[System] Starting Reranker Server...");
-  const rerankerScript = path.resolve(rootDir, "packages/core/reranker_server.py");
+  const rerankerScript = path.resolve(rootDir, "packages/reranker/reranker_server.py");
   if (fs.existsSync(rerankerScript)) {
     rerankerProcess = spawn("python", [rerankerScript], {
       detached: true,
@@ -1190,13 +1235,18 @@ fastify.post("/aether/engine/start", async () => {
   }
 
   void (async () => {
-    const rerankerReady = await waitForHttpReady("http://127.0.0.1:8082/health", 120000, 1000);
+    const [rerankerReady, daemonReady] = await Promise.all([
+      waitForHttpReady("http://127.0.0.1:8082/health", 120000, 1000),
+      waitForSocket(getSocketPath(), 120000, 1000)
+    ]);
+    
     if (engineStatus !== "starting") {
       return;
     }
 
-    if (!rerankerReady) {
-      addLog("[System] ❌ Reranker did not become ready in time.");
+    if (!rerankerReady || !daemonReady) {
+      if (!rerankerReady) addLog("[System] ❌ Reranker did not become ready in time.");
+      if (!daemonReady) addLog("[System] ❌ Core Daemon socket was never created. Did it crash?");
       engineStatus = "stopped";
       return;
     }

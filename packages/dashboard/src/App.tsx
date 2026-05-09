@@ -186,6 +186,27 @@ export default function App() {
     void persistConfig();
   };
 
+  const handleToggleBypass = useCallback(async () => {
+    const newConfig = { ...config, bypassAether: !config.bypassAether };
+    setConfig(newConfig);
+    try {
+      const response = await fetch(`${API_BASE}/aether/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newConfig),
+      });
+      if (response.ok) {
+        addToast(newConfig.bypassAether ? 'Aether pipeline bypassed (Baseline mode)' : 'Aether pipeline active', 'success');
+      } else {
+        addToast('Failed to save bypass configuration.', 'error');
+        setConfig(config); // revert
+      }
+    } catch {
+      addToast('Network error — is the Gateway running?', 'error');
+      setConfig(config); // revert
+    }
+  }, [config, addToast]);
+
   return (
     <DashboardView
       activeTab={activeTab}
@@ -205,6 +226,7 @@ export default function App() {
       onToggleEngine={toggleEngine}
       onPickFolder={pickFolder}
       onSaveConfig={handleSaveConfig}
+      onToggleBypass={handleToggleBypass}
     />
   );
 }

@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity, Settings, Cpu, Database, Clock, RefreshCw, Save,
   Zap, Box, Server, Power, AlertTriangle, CheckCircle, X, WifiOff,
-  FolderOpen, List, Terminal, Brain
+  FolderOpen, List, Terminal, Brain, ZapOff
 } from 'lucide-react';
 
 export type DashboardTab = 'metrics' | 'history' | 'indexing' | 'logs' | 'config';
@@ -24,6 +24,7 @@ export interface DashboardBenchmarkStats {
 export interface DashboardConfig {
   modelPath: string;
   tokenBudget: number;
+  bypassAether?: boolean;
 }
 
 export interface DashboardStats {
@@ -221,10 +222,12 @@ type SidebarProps = {
   setActiveTab: (tab: DashboardTab) => void;
   services: DashboardServices;
   engineStatus: DashboardEngineStatus;
+  config: DashboardConfig;
   onToggleEngine: () => void;
+  onToggleBypass: () => void;
 };
 
-const Sidebar = ({ activeTab, setActiveTab, services, engineStatus, onToggleEngine }: SidebarProps) => (
+const Sidebar = ({ activeTab, setActiveTab, services, engineStatus, config, onToggleEngine, onToggleBypass }: SidebarProps) => (
   <aside className="w-64 border-r border-zinc-800/50 bg-zinc-950/50 flex flex-col backdrop-blur-xl">
     <div className="h-16 flex items-center px-6 border-b border-zinc-800/50">
       <div className="flex items-center gap-2 text-indigo-400 font-bold text-lg tracking-wide">
@@ -279,6 +282,23 @@ const Sidebar = ({ activeTab, setActiveTab, services, engineStatus, onToggleEngi
             </div>
           </div>
         ))}
+      </div>
+
+      <div className="flex items-center justify-between p-3 rounded-xl bg-zinc-900/50 border border-zinc-800/50">
+        <div className="flex items-center gap-2">
+          <Zap className={`w-4 h-4 ${config.bypassAether ? 'text-amber-500' : 'text-indigo-400'}`} />
+          <div className="flex flex-col">
+            <span className="text-xs font-semibold text-zinc-300">Pipeline Bypass</span>
+            <span className="text-[10px] text-zinc-500">{config.bypassAether ? 'Baseline Mode' : 'Aether Active'}</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onToggleBypass}
+          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${config.bypassAether ? 'bg-amber-500/20' : 'bg-indigo-500/20'}`}
+        >
+          <span className={`inline-block h-3 w-3 transform rounded-full transition-transform ${config.bypassAether ? 'translate-x-5 bg-amber-400' : 'translate-x-1 bg-indigo-400'}`} />
+        </button>
       </div>
 
       <button
@@ -548,6 +568,11 @@ type HistoryRowProps = {
 };
 
 const HistoryRow = ({ request }: HistoryRowProps) => {
+  const formatTime = (ms: number) => {
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    return `${(ms / 1000).toFixed(2)}s`;
+  };
+
   const rawTokens = request.tokensRaw ?? request.tokensBefore ?? 0;
   const finalTokens = request.tokensAfter ?? request.tokensBefore ?? 0;
   const engineeredTokens = request.tokensBefore ?? 0;
@@ -557,20 +582,25 @@ const HistoryRow = ({ request }: HistoryRowProps) => {
   const totalPct = rawTokens > 0 ? Math.round(((rawTokens - finalTokens) / rawTokens) * 100) : 0;
 
   return (
-    <tr className={`hover:bg-zinc-800/30 transition-colors ${request.ok ? '' : 'bg-rose-950/10'}`}>
+    <tr className={`hover:bg-zinc-800/30 transition-colors ${request.bypass ? 'bg-amber-950/10' : request.ok ? '' : 'bg-rose-950/10'}`}>
       <td className="px-6 py-4 whitespace-nowrap text-xs">{new Date(request.ts).toLocaleTimeString()}</td>
-      <td className="px-6 py-4">
+      <td className="px-6 py-4 flex flex-col gap-1.5">
         {request.ok ? (
-          <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+          <span className="inline-flex w-max items-center gap-1.5 px-2 py-1 rounded text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
             <CheckCircle className="w-3 h-3" /> OK
           </span>
         ) : (
-          <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium bg-rose-500/10 text-rose-400 border border-rose-500/20">
+          <span className="inline-flex w-max items-center gap-1.5 px-2 py-1 rounded text-xs font-medium bg-rose-500/10 text-rose-400 border border-rose-500/20">
             <AlertTriangle className="w-3 h-3" /> FAILED
           </span>
         )}
+        {request.bypass && (
+          <span className="inline-flex w-max items-center gap-1.5 px-2 py-1 rounded text-[10px] font-bold tracking-widest bg-amber-500/10 text-amber-400 border border-amber-500/20 uppercase">
+            <ZapOff className="w-3 h-3" /> Bypassed
+          </span>
+        )}
       </td>
-      <td className="px-6 py-4 font-mono text-zinc-300">{(((request.astTime ?? 0) + (request.ragTime ?? 0)) / 1000).toFixed(2)}s</td>
+      <td className="px-6 py-4 font-mono text-zinc-300">{formatTime((request.astTime ?? 0) + (request.ragTime ?? 0))}</td>
       <td className="px-6 py-4 font-mono">
         {request.rerankTime > 0 ? (
           <span className="text-purple-400 flex items-center gap-1">
@@ -580,21 +610,27 @@ const HistoryRow = ({ request }: HistoryRowProps) => {
           <span className="text-zinc-600">—</span>
         )}
       </td>
-      <td className="px-6 py-4 font-mono">{((request.ttft ?? 0) / 1000).toFixed(2)}s</td>
+      <td className="px-6 py-4 font-mono">{formatTime(request.ttft ?? 0)}</td>
       <td className="px-6 py-4 font-mono text-emerald-400">{request.tps ?? 0} <span className="text-[10px] text-zinc-500 uppercase">t/s</span></td>
-      <td className="px-6 py-4 font-mono">{((request.latencyMs ?? 0) / 1000).toFixed(2)}s</td>
+      <td className="px-6 py-4 font-mono">{formatTime(request.latencyMs ?? 0)}</td>
       <td className="px-6 py-4 font-mono text-xs">{finalTokens} <span className="text-zinc-500">tok</span></td>
       <td className="px-6 py-4 text-xs">
         <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-1 text-zinc-500">
-            <span className="font-mono text-zinc-300">{rawTokens}</span>
-            <span>→</span>
-            <span className="font-mono text-emerald-400">{finalTokens}</span>
-            {totalPct > 0 && <span className="text-amber-400 font-semibold">({totalPct}% saved)</span>}
-          </div>
-          {ideRemoved > 0 && <span className="text-rose-400/80 font-mono">IDE filter: -{ideRemoved}</span>}
-          {injectedTokens > 0 && <span className="text-sky-400/80 font-mono">Aether inject: +{injectedTokens}</span>}
-          {budgetCut > 0 && <span className="text-orange-400/80 font-mono">Budget trim: -{budgetCut}</span>}
+          {request.bypass ? (
+            <span className="text-amber-500 font-mono text-xs">Baseline — Model only</span>
+          ) : (
+            <>
+              <div className="flex items-center gap-1 text-zinc-500">
+                <span className="font-mono text-zinc-300">{rawTokens}</span>
+                <span>→</span>
+                <span className="font-mono text-emerald-400">{finalTokens}</span>
+                {totalPct > 0 && <span className="text-amber-400 font-semibold">({totalPct}% saved)</span>}
+              </div>
+              {ideRemoved > 0 && <span className="text-rose-400/80 font-mono">IDE filter: -{ideRemoved}</span>}
+              {injectedTokens > 0 && <span className="text-sky-400/80 font-mono">Aether inject: +{injectedTokens}</span>}
+              {budgetCut > 0 && <span className="text-orange-400/80 font-mono">Budget trim: -{budgetCut}</span>}
+            </>
+          )}
         </div>
       </td>
     </tr>
@@ -990,6 +1026,7 @@ type DashboardViewProps = Readonly<{
   onToggleEngine: () => void;
   onPickFolder: () => void;
   onSaveConfig: (event: React.SubmitEvent<HTMLFormElement>) => void;
+  onToggleBypass: () => void;
 }>;
 
 export default function DashboardView({
@@ -1010,6 +1047,7 @@ export default function DashboardView({
   onToggleEngine,
   onPickFolder,
   onSaveConfig,
+  onToggleBypass,
 }: DashboardViewProps) {
   const logsEndRef = useRef<HTMLDivElement>(null);
 
@@ -1024,7 +1062,7 @@ export default function DashboardView({
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-50 flex font-sans selection:bg-indigo-500/30">
       <ToastStack toasts={toasts} onDismissToast={onDismissToast} />
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} services={services} engineStatus={engineStatus} onToggleEngine={onToggleEngine} />
+      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} services={services} engineStatus={engineStatus} config={config} onToggleEngine={onToggleEngine} onToggleBypass={onToggleBypass} />
 
       <main className="flex-1 overflow-auto bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-zinc-900/40 via-zinc-950 to-zinc-950">
         <header className="h-16 flex items-center justify-between px-8 border-b border-zinc-800/30">

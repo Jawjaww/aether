@@ -1,45 +1,97 @@
-import * as path from "node:path";
+// packages/core/src/indexer/reranker.ts
+//
+// Surgical Reranking Client — calls the Python reranker server on port 8082.
+//
+// Key changes vs. original:
+//  1. Explicit fallback: returns { results: [], fallback: true } instead of
+//     zero-scored phantoms when the server is unreachable.
+//  2. checkRerankerHealth() — proactive ping with 500 ms timeout for startup
+//     health checks and Gateway /status exposure.
+//  3. Type-safe RerankResult with fallback discriminant.
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface RerankResult {
   index: number;
   score: number;
 }
 
+export type RerankResponse =
+  | { results: RerankResult[]; fallback: false }
+  | { results: []; fallback: true; reason: string };
+
+// ─── Health check ─────────────────────────────────────────────────────────────
+
 /**
- * Surgical Reranking Client
- * Calls the local Python Reranker Server (port 8082)
+ * Proactive health ping — safe to call at daemon startup and to expose via
+ * the Gateway /aether/engine/status endpoint.
+ * Uses a 500 ms timeout to avoid blocking the daemon boot sequence.
  */
-export const initReranker = async () => {
-  console.log("[Reranker] Client configured for Python Server (127.0.0.1:8082)");
-  // No local initialization needed anymore as it's a remote service
+export const checkRerankerHealth = async (): Promise<boolean> => {
+  try {
+    const res = await fetch("http://127.0.0.1:8082/health", {
+      signal: AbortSignal.timeout(500),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 };
 
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+export const initReranker = async (): Promise<void> => {
+  const healthy = await checkRerankerHealth();
+  if (healthy) {
+    console.log("[Reranker] ✅ Python server reachable on 127.0.0.1:8082");
+  } else {
+    console.warn(
+      "[Reranker] ⚠️  Python server not reachable on 127.0.0.1:8082 — will use fallback mode until it becomes available",
+    );
+  }
+};
+
+// ─── Rerank ───────────────────────────────────────────────────────────────────
+
+/**
+ * Call the Python cross-encoder to rerank `documents` for `query`.
+ *
+ * On success: returns scored, sorted results (top `topN`).
+ * On failure: returns an explicit fallback object — the caller must handle
+ *   the `fallback: true` case and surface a warning to the user instead of
+ *   silently returning degraded (BM25-order, zero-scored) results.
+ */
 export const rerank = async (
   query: string,
   documents: string[],
-  topN: number = 15
-): Promise<RerankResult[]> => {
-  if (documents.length === 0) return [];
+  topN: number = 15,
+): Promise<RerankResponse> => {
+  if (documents.length === 0) return { results: [], fallback: false };
 
   try {
     const response = await fetch("http://127.0.0.1:8082/rerank", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query, documents }),
+      signal: AbortSignal.timeout(8000), // 8 s hard timeout
     });
 
     if (!response.ok) {
-      throw new Error(`Reranker server error: ${response.statusText}`);
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
 
-    const data = await response.json() as { results: RerankResult[] };
-    
-    return data.results
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topN);
+    const data = (await response.json()) as { results: RerankResult[] };
+
+    return {
+      results: data.results.sort((a, b) => b.score - a.score).slice(0, topN),
+      fallback: false,
+    };
   } catch (err) {
-    console.error("[Reranker] Client error. Falling back to standard order.", err);
-    // Fallback: return first N documents in original order
-    return documents.slice(0, topN).map((_, i) => ({ index: i, score: 0 }));
+    console.error("[Reranker] ❌ Rerank request failed — activating fallback mode:", err);
+    return {
+      results: [],
+      fallback: true,
+      reason: err instanceof Error ? err.message : "reranker_unavailable",
+    };
   }
 };

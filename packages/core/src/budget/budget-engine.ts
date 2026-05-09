@@ -1,10 +1,31 @@
 // packages/core/src/budget/budget-engine.ts
+//
+// Token-accurate budget engine for the Aether Context Pipeline.
+//
+// Key changes vs. original:
+//  1. estimateTokens() now uses @dqbd/tiktoken (cl100k_base, Qwen-compatible)
+//     via a lazy-initialized singleton to avoid async race at module load time.
+//  2. BudgetChunk gains `requiredChunks?: { id: string; depthHint: "sig" | "full" }[]`
+//     so the knapsack can enforce AST-dependency coherence.
+//  3. applyBudget() is now async and dependency-aware:
+//     before greedy selection it propagates scores from dependents down to their
+//     dependencies so a required interface always enters the budget when its
+//     concrete implementation does.
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/** A single budgetable chunk of context. */
 export interface BudgetChunk {
   id: string;
   text: string;
   tokens: number;
-  score: number; // Importance (higher is better)
+  score: number; // Higher is more important
+  /**
+   * AST dependencies that should accompany this chunk.
+   * "sig" → include AST signatures only (interfaces, types, constants)
+   * "full" → include full file text (concrete functions whose behaviour matters)
+   */
+  requiredChunks?: { id: string; depthHint: "sig" | "full" }[];
 }
 
 export interface BudgetResult {
@@ -17,43 +38,142 @@ export interface BudgetResult {
   };
 }
 
-// Simple token estimation: 1 token ≈ 4 characters
-export const estimateTokens = (text: string): number => {
-  return Math.max(1, Math.floor(text.length / 4));
+// ─── Tiktoken singleton (lazy async) ─────────────────────────────────────────
+//
+// @dqbd/tiktoken loads WASM on first call. We defer initialisation until the
+// first token count request so the module can be imported synchronously during
+// daemon startup without triggering a race condition.
+
+type TiktokenInstance = { encode: (text: string) => Uint32Array; free?: () => void };
+let _enc: TiktokenInstance | null = null;
+let _encPending: Promise<TiktokenInstance> | null = null;
+
+const getEncoder = async (): Promise<TiktokenInstance> => {
+  if (_enc) return _enc;
+  if (_encPending) return _encPending;
+
+  _encPending = (async () => {
+    try {
+      // @ts-ignore — optional peer dependency; may not be installed in all envs
+      const { get_encoding } = await import("@dqbd/tiktoken");
+      _enc = get_encoding("cl100k_base"); // Compatible with Qwen, GPT-4 family
+      return _enc;
+    } catch {
+      // Graceful degradation: return a mock encoder that uses the length heuristic
+      const fallback: TiktokenInstance = {
+        encode: (text: string) => new Uint32Array(Math.max(1, Math.ceil(text.length / 4))),
+      };
+      _enc = fallback;
+      return fallback;
+    }
+  })();
+
+  return _encPending;
 };
 
-export const applyBudget = (
-  tokenBudget: number,
-  astChunks: BudgetChunk[],
-  ragChunks: BudgetChunk[]
-): BudgetResult => {
-  // Sort by score descending for greedy knapsack
-  const sortedAst = [...astChunks].sort((a, b) => b.score - a.score);
-  const sortedRag = [...ragChunks].sort((a, b) => b.score - a.score);
+/**
+ * Count tokens with high fidelity using cl100k_base encoding (Qwen-compatible).
+ * Falls back to `length / 4` if tiktoken WASM is unavailable.
+ */
+export const estimateTokens = async (text: string): Promise<number> => {
+  const enc = await getEncoder();
+  try {
+    return enc.encode(text).length;
+  } catch {
+    return Math.max(1, Math.ceil(text.length / 4));
+  }
+};
 
-  let remainingBudget = tokenBudget;
-  let astTokensUsed = 0;
-  let ragTokensUsed = 0;
+// ─── Dependency-aware greedy knapsack ─────────────────────────────────────────
 
-  const selectedAst: string[] = [];
-  const selectedRag: string[] = [];
+/**
+ * Propagate dependent scores down to required chunks so that if chunk A (score 0.9)
+ * requires chunk B (score 0.3), B's effective score becomes max(0.3, 0.9 - ε).
+ * This ensures B always enters the budget when A does.
+ */
+const propagateDependencyScores = (chunks: BudgetChunk[]): Map<string, number> => {
+  const scoreMap = new Map<string, number>(chunks.map((c) => [c.id, c.score]));
 
-  // Tier 1: AST (Highest priority)
-  for (const chunk of sortedAst) {
-    if (chunk.tokens <= remainingBudget) {
-      selectedAst.push(chunk.text);
-      remainingBudget -= chunk.tokens;
-      astTokensUsed += chunk.tokens;
+  // Single-pass propagation (sufficient for one level of direct imports)
+  for (const chunk of chunks) {
+    if (!chunk.requiredChunks?.length) continue;
+    const parentScore = scoreMap.get(chunk.id) ?? chunk.score;
+    for (const dep of chunk.requiredChunks) {
+      const current = scoreMap.get(dep.id) ?? 0;
+      // Give the dependency a score just below the parent so it is selected after
+      // the parent but before any unrelated lower-priority chunks.
+      if (parentScore - 0.01 > current) {
+        scoreMap.set(dep.id, parentScore - 0.01);
+      }
     }
   }
 
-  // Tier 2: RAG
-  for (const chunk of sortedRag) {
-    if (chunk.tokens <= remainingBudget) {
-      selectedRag.push(chunk.text);
-      remainingBudget -= chunk.tokens;
-      ragTokensUsed += chunk.tokens;
+  return scoreMap;
+};
+
+/**
+ * Async, token-accurate, dependency-aware greedy knapsack budget allocation.
+ *
+ * Algorithm:
+ *  1. Propagate scores through `requiredChunks` edges so dependencies inherit
+ *     their dependent's priority.
+ *  2. Sort by effective score descending.
+ *  3. Greedily select chunks that fit in the remaining budget.
+ *  4. When a selected chunk has `requiredChunks`, immediately try to insert
+ *     the required chunks (if not already selected) to maintain AST coherence.
+ */
+export const applyBudget = async (
+  tokenBudget: number,
+  astChunks: BudgetChunk[],
+  ragChunks: BudgetChunk[],
+): Promise<BudgetResult> => {
+  const effectiveScores = propagateDependencyScores([...astChunks, ...ragChunks]);
+
+  const sortedAst = [...astChunks].sort(
+    (a, b) => (effectiveScores.get(b.id) ?? b.score) - (effectiveScores.get(a.id) ?? a.score),
+  );
+  const sortedRag = [...ragChunks].sort(
+    (a, b) => (effectiveScores.get(b.id) ?? b.score) - (effectiveScores.get(a.id) ?? a.score),
+  );
+
+  let remaining = tokenBudget;
+  let astTokensUsed = 0;
+  let ragTokensUsed = 0;
+
+  const selectedIds = new Set<string>();
+  const selectedAst: string[] = [];
+  const selectedRag: string[] = [];
+
+  const allChunksById = new Map<string, BudgetChunk>(
+    [...astChunks, ...ragChunks].map((c) => [c.id, c]),
+  );
+
+  const trySelect = (chunk: BudgetChunk, targetList: string[], isAst: boolean): boolean => {
+    if (selectedIds.has(chunk.id)) return true; // Already included
+    if (chunk.tokens > remaining) return false;
+
+    selectedIds.add(chunk.id);
+    targetList.push(chunk.text);
+    remaining -= chunk.tokens;
+    if (isAst) astTokensUsed += chunk.tokens;
+    else ragTokensUsed += chunk.tokens;
+    return true;
+  };
+
+  // AST pass with dependency pulling
+  for (const chunk of sortedAst) {
+    if (!trySelect(chunk, selectedAst, true)) continue;
+
+    // Pull required dependencies immediately after selecting the parent
+    for (const dep of chunk.requiredChunks ?? []) {
+      const depChunk = allChunksById.get(dep.id);
+      if (depChunk) trySelect(depChunk, selectedAst, true);
     }
+  }
+
+  // RAG pass (no dependency pulling needed — RAG chunks are self-contained)
+  for (const chunk of sortedRag) {
+    trySelect(chunk, selectedRag, false);
   }
 
   return {

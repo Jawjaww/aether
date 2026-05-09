@@ -135,15 +135,20 @@ Aether implements a three-tier quantization policy:
 - [x] Streaming responses
 - [x] MCP server integration
 
-### Phase 2: Optimization
+### Phase 2: Reliability & Precision (Implemented)
 
-- [ ] Quantized Reranker (distill/distilbert-base-uncased)
-- [ ] Multi-LLM routing (Qwen3.6-35B <=> Qwen2.5-7B)
-- [ ] Context window compression
-- [ ] Incremental RAG updates
+- [x] **Token counting** — Replaced `length / 4` heuristic with `@dqbd/tiktoken` `cl100k_base` encoder (lazy async singleton, graceful WASM fallback)
+- [x] **Reranker circuit-breaker** — Explicit fallback (`fallback: true` flag) instead of zero-scored phantom results; proactive `/health` ping at startup; `AbortSignal.timeout(8s)` on all reranker requests
+- [x] **Task classifier** — Heuristic multi-pattern classifier replaces cyclomatic-score thresholding; outputs `TaskType` + `confidence` (0–1) + dynamic `budgetTokens`; low-confidence results auto-escalate to the next budget tier
+- [x] **Dependency-aware knapsack** — `BudgetChunk.requiredChunks` with `depthHint: "sig" | "full"`; score propagation ensures required interfaces enter the budget alongside their dependents
+- [x] **Session context cache** — Hash-based LRU (50 entries, 5 min TTL) keyed on `taskText + activeFilePath + tokenBudget + fileModifiedAt`; avoids full AST+RAG pipeline re-runs for identical requests
+- [x] **Reranker Python package** — Moved to `packages/reranker/` with `pyproject.toml`; installable via `pip install -e packages/reranker`
 
 ### Phase 3: Advanced Features
 
+- [ ] Multi-LLM routing (Qwen3.6-35B ↔ Qwen2.5-7B based on task classifier output)
 - [ ] Real-time code analysis
 - [ ] Cross-file refactoring
 - [ ] Predictive code completion
+- [ ] Telemetry auto-calibration (feedback loop from `recordTelemetry` → threshold tuning)
+
