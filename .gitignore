@@ -72,3 +72,7 @@ pip-wheel-metadata/
 Dockerfile.*
 docker-compose.override.yml
 node_modules
+
+# Sorties de banc : mesures propres à une machine, non reproductibles ailleurs.
+# Les scripts de mesure (tools/*.py, tools/*.sh) sont versionnés, pas leurs résultats.
+tools/results/

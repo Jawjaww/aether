@@ -9,6 +9,7 @@
 
 import Parser from "tree-sitter";
 import TSLanguage from "tree-sitter-typescript";
+import { extractHeuristicSignatures } from "./heuristic-extractor.js";
 import * as nodePath from "node:path";
 import { promises as fsp } from "node:fs";
 import { createHash } from "node:crypto";
@@ -27,10 +28,34 @@ const tsxParser = new Parser();
 tsParser.setLanguage(_tsLang);
 tsxParser.setLanguage(_tsxLang);
 
-const getParser = (fp: string): { parser: Parser; lang: any } =>
-  fp.endsWith(".tsx")
+/**
+ * Extensions traitées comme du code (AST ou heuristique), et extensions de texte
+ * simplement indexées pour la récupération. Source unique de vérité : le daemon
+ * importe ces listes au lieu de dupliquer les tests de suffixe.
+ */
+export const CODE_EXTENSIONS = [
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+  ".py", ".go", ".rs",
+] as const;
+export const TEXT_EXTENSIONS = [".md"] as const;
+export const INDEXED_EXTENSIONS: readonly string[] = [...CODE_EXTENSIONS, ...TEXT_EXTENSIONS];
+
+/**
+ * Famille TypeScript/JavaScript.
+ *
+ * Le parseur TypeScript installé est un **sur-ensemble de JavaScript** : il parse
+ * donc les `.js`/`.jsx`/`.mjs`/`.cjs` sans dépendance supplémentaire, avec une
+ * fidélité bien supérieure à une analyse par expressions régulières.
+ */
+const TS_FAMILY_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+const JSX_FAMILY_EXTENSIONS = new Set([".tsx", ".jsx"]);
+
+const getParser = (fp: string): { parser: Parser; lang: any } => {
+  const ext = fp.slice(fp.lastIndexOf(".")).toLowerCase();
+  return JSX_FAMILY_EXTENSIONS.has(ext)
     ? { parser: tsxParser, lang: _tsxLang }
     : { parser: tsParser, lang: _tsLang };
+};
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
@@ -45,7 +70,8 @@ export interface FunctionSignature {
 }
 
 export interface TypeDeclaration {
-  kind: "interface" | "type" | "enum";
+  /** `interface`/`type`/`enum` pour TypeScript ; `class`/`struct`/`trait` ailleurs. */
+  kind: "interface" | "type" | "enum" | "class" | "struct" | "trait";
   name: string;
   body: string;
   isExported: boolean;
@@ -438,8 +464,45 @@ const buildAstChunkFromSource = (
   source: string,
   fileHash: string,
 ): ASTChunk | null => {
-  const ext = nodePath.extname(filePath);
-  if (ext !== ".ts" && ext !== ".tsx") return null;
+  const ext = nodePath.extname(filePath).toLowerCase();
+
+  // Langages couverts par l'extracteur heuristique (grammaire tree-sitter non
+  // installable ici) : Python, Go, Rust.
+  if (!TS_FAMILY_EXTENSIONS.has(ext)) {
+    const heuristic = extractHeuristicSignatures(filePath, source);
+    if (heuristic) {
+      return {
+        filePath,
+        fileHash,
+        functions: heuristic.functions,
+        types: heuristic.types,
+        components: [],
+        rnStyles: [],
+        imports: heuristic.imports,
+        exports: [
+          ...heuristic.functions.filter((f) => f.isExported).map((f) => f.name),
+          ...heuristic.types.filter((t) => t.isExported).map((t) => t.name),
+        ],
+        cyclicRefs: [],
+        cyclomaticScore: heuristic.cyclomaticScore,
+        extractedAt: Date.now(),
+      };
+    }
+
+    // Fichier non-code (README, etc.) : chunk minimal pour l'indexation RAG.
+    return {
+      filePath,
+      fileHash,
+      functions: [],
+      types: [],
+      components: [],
+      rnStyles: [],
+      imports: [],
+      exports: [],
+      cyclicRefs: [],
+      extractedAt: Date.now(),
+    };
+  }
 
   const { parser, lang } = getParser(filePath);
   let tree: Parser.Tree;
@@ -497,7 +560,11 @@ export const extractFile = async (
 // ─── Import resolution → absolute path ────────────────────────────────────────
 // Tries common extensions in order to find the real file.
 
-const RESOLVE_EXTS = [".ts", ".tsx", "/index.ts", "/index.tsx", ".d.ts"];
+const RESOLVE_EXTS = [
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+  "/index.ts", "/index.tsx", "/index.js",
+  ".d.ts",
+];
 
 const resolveImport = async (
   fromFile: string,
@@ -832,10 +899,7 @@ export const scanProject = async (projectRoot: string): Promise<ASTGraph> => {
           if (["node_modules", "dist", ".git", ".aether"].includes(name))
             return;
           await walk(full);
-        } else if (
-          e.isFile() &&
-          (name.endsWith(".ts") || name.endsWith(".tsx"))
-        ) {
+        } else if (e.isFile() && CODE_EXTENSIONS.some((x) => name.endsWith(x))) {
           allFiles.push(full);
         }
       }),

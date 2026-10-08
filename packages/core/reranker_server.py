@@ -3,6 +3,15 @@ import uvicorn
 from pydantic import BaseModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import torch
+import numpy as np
+
+# Try to import fastembed for lightweight embeddings
+try:
+    from fastembed import TextEmbedding
+    embedding_model = TextEmbedding(model_name="nomic-ai/nomic-embed-text-v1.5")
+    has_fastembed = True
+except ImportError:
+    has_fastembed = False
 
 app = FastAPI()
 model_id = "BAAI/bge-reranker-v2-m3"
@@ -21,11 +30,18 @@ class RerankRequest(BaseModel):
     query: str
     documents: list[str]
 
+class EmbeddingRequest(BaseModel):
+    model: str = "nomic-embed-text"
+    input: str | list[str]
 
 @app.get("/health")
 async def health_endpoint():
-    return {"status": "ok" if model_ready else "loading", "ready": model_ready, "model": model_id}
-
+    return {
+        "status": "ok" if model_ready else "loading", 
+        "ready": model_ready, 
+        "model": model_id,
+        "embeddings_ready": has_fastembed
+    }
 
 def score_batch(query: str, documents: list[str]) -> list[float]:
     with torch.inference_mode():
@@ -55,6 +71,30 @@ async def rerank_endpoint(req: RerankRequest):
         )
 
     return {"results": results}
+
+@app.post("/v1/embeddings")
+async def embeddings_endpoint(req: EmbeddingRequest):
+    if not has_fastembed:
+        return {"error": "fastembed not installed", "code": 500}
+    
+    # We use the internal model regardless of what the client asks for (e.g. nomic)
+    inputs = [req.input] if isinstance(req.input, str) else req.input
+    embeddings = list(embedding_model.embed(inputs))
+    
+    data = []
+    for i, emb in enumerate(embeddings):
+        data.append({
+            "object": "embedding",
+            "index": i,
+            "embedding": emb.tolist()
+        })
+    
+    return {
+        "object": "list",
+        "data": data,
+        "model": req.model,
+        "usage": {"prompt_tokens": 0, "total_tokens": 0}
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8082)

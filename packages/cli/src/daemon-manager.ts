@@ -290,18 +290,25 @@ export const stop = (projectRoot: string): void => {
   // 1) Stop the gateway if present
   stopByPidFile(path.join(paths.dir, "gateway.pid"), "gateway");
 
-  // 2) Stop the daemon (as before)
+  // 2) Stop the daemon
   const { alive, pid } = status(projectRoot);
-
-  if (!alive || pid === null) {
-    console.log("⚪ No active daemon for this project");
-    return;
+  if (alive && pid !== null) {
+    tryKill(pid, "daemon");
   }
 
-  tryKill(pid, "daemon");
+  // 3) AGGRESSIVE CLEANUP: Use pkill to find processes by name (handles orphans)
+  try {
+    console.log("🧹 Running aggressive cleanup (pkill)...");
+    spawnSync("pkill", ["-f", "aether/packages/gateway/dist/server.js"]);
+    spawnSync("pkill", ["-f", "aether/packages/core/dist/daemon.js"]);
+    spawnSync("pkill", ["-f", "reranker_server.py"]);
+  } catch {
+    // ignore if pkill is missing
+  }
 
-  // Clean PID file — daemon handles .sock via its SIGTERM handler
+  // Clean PID file and Socket
   if (fs.existsSync(paths.pid)) fs.unlinkSync(paths.pid);
+  if (fs.existsSync(paths.sock)) fs.unlinkSync(paths.sock);
 };
 
 // ─── logs ─────────────────────────────────────────────────────────────────────

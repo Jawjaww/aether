@@ -1,60 +1,35 @@
-from fastapi import FastAPI
-import uvicorn
-from pydantic import BaseModel
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-import torch
+"""Point d'entrée empaqueté du serveur ML unifié d'Aether.
 
-app = FastAPI()
-model_id = "BAAI/bge-reranker-v2-m3"
-device = "mps"
-max_length = 512
-max_batch_size = 32
-model_ready = False
+Il n'existe qu'**une** implémentation : ``packages/core/reranker_server.py``, qui
+sert à la fois le cross-encoder BGE-v2-m3 sur MPS (``/rerank``) et les embeddings
+FastEmbed (``/v1/embeddings``) sur le port 8082.
 
-print(f"[Reranker] Loading {model_id} on MPS...")
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForSequenceClassification.from_pretrained(model_id).to(device)
-model.eval()
-model_ready = True
+Ce module n'est qu'un lanceur. Il remplace l'ancienne copie divergente du serveur,
+qui n'avait pas l'endpoint ``/v1/embeddings`` et donnait donc un index RAG vide
+quand on la lançait (audit octobre 2026, constat P2-2).
 
-class RerankRequest(BaseModel):
-    query: str
-    documents: list[str]
+Usage :
+    aether-reranker                 # après `pip install -e packages/reranker`
+    python packages/reranker/reranker_server.py
+"""
 
+from __future__ import annotations
 
-@app.get("/health")
-async def health_endpoint():
-    return {"status": "ok" if model_ready else "loading", "ready": model_ready, "model": model_id}
+import runpy
+from pathlib import Path
+
+# packages/reranker/reranker_server.py -> packages/core/reranker_server.py
+CANONICAL = Path(__file__).resolve().parents[1] / "core" / "reranker_server.py"
 
 
-def score_batch(query: str, documents: list[str]) -> list[float]:
-    with torch.inference_mode():
-        inputs = tokenizer(
-            [query] * len(documents),
-            documents,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-            max_length=max_length,
-        ).to(device)
-        scores = model(**inputs, return_dict=True).logits.view(-1).float()
-    return scores.cpu().tolist()
-
-@app.post("/rerank")
-async def rerank_endpoint(req: RerankRequest):
-    if not req.documents:
-        return {"results": []}
-
-    results = []
-    for start in range(0, len(req.documents), max_batch_size):
-        batch_documents = req.documents[start:start + max_batch_size]
-        batch_scores = score_batch(req.query, batch_documents)
-        results.extend(
-            {"index": start + i, "score": float(score)}
-            for i, score in enumerate(batch_scores)
+def main() -> None:
+    if not CANONICAL.exists():
+        raise SystemExit(
+            f"Serveur canonique introuvable : {CANONICAL}\n"
+            "Attendu : packages/core/reranker_server.py"
         )
+    runpy.run_path(str(CANONICAL), run_name="__main__")
 
-    return {"results": results}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8082)
+    main()

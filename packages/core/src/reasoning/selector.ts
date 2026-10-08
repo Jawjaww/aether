@@ -26,11 +26,11 @@ export type TaskType =
 
 /** Token budgets per task type. */
 export const BUDGET_BY_TASK: Record<TaskType, number> = {
-  read_local:      3_000,
-  write_local:     5_000,
-  cross_file:     10_000,
-  debug:          12_000,
-  generate_tests:  6_000,
+  read_local:      8_000,
+  write_local:    10_000,
+  cross_file:     14_000,
+  debug:          16_000,
+  generate_tests: 12_000,
 };
 
 /** Task types that always benefit from extended thinking. */

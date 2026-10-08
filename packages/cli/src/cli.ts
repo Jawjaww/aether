@@ -36,7 +36,7 @@ switch (command) {
     await runStart({
       projectPath: projectRoot,
       port: 8080,
-      ollamaUrl: "http://127.0.0.1:11434",
+      ollamaUrl: "http://127.0.0.1:8000",
     });
     break;
   }
@@ -52,7 +52,7 @@ switch (command) {
     await runStart({
       projectPath: projectRoot,
       port: 8080,
-      ollamaUrl: "http://127.0.0.1:11434",
+      ollamaUrl: "http://127.0.0.1:8000",
     });
     break;
   }

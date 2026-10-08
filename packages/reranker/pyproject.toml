@@ -1,9 +1,11 @@
 [project]
 name = "aether-reranker"
 version = "0.1.0"
-description = "Aether surgical reranker server — cross-encoder on Apple Silicon MPS"
+description = "Aether unified ML server — BGE cross-encoder on Apple Silicon MPS + FastEmbed embeddings (port 8082)"
 requires-python = ">=3.10"
 
+# fastembed et numpy étaient absents alors que le serveur canonique les importe :
+# sans fastembed, /v1/embeddings renvoie une erreur et l'index RAG reste vide.
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn>=0.29.0",
@@ -11,6 +13,8 @@ dependencies = [
     "torch>=2.1.0",
     "transformers>=4.40.0",
     "sentencepiece",
+    "fastembed>=0.3.0",
+    "numpy>=1.26.0",
 ]
 
 [project.optional-dependencies]
@@ -24,8 +28,10 @@ aether-reranker = "reranker_server:main"
 
 [build-system]
 requires = ["setuptools>=69.0"]
-build-backend = "setuptools.backends.legacy:build"
+# « setuptools.backends.legacy:build » n'est pas un backend valide : l'installation
+# échouait. Le backend standard est setuptools.build_meta.
+build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["reranker_server*"]
+[tool.setuptools]
+# Un seul module : le lanceur, qui exécute packages/core/reranker_server.py.
+py-modules = ["reranker_server"]

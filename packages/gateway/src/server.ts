@@ -6,7 +6,7 @@
 
 import Fastify from "fastify";
 import { createConnection } from "node:net";
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn, spawnSync, ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -19,6 +19,11 @@ import {
   streamResponseBody,
   terminateProcessGroup,
 } from "./server-utils.js";
+import {
+  buildCleanPayload,
+  shapeTools,
+  type AetherContextResponse,
+} from "./payload.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,9 +31,31 @@ const __dirname = path.dirname(__filename);
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const GATEWAY_PORT = Number.parseInt(process.env.AETHER_PORT ?? "8080", 10);
-const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://127.0.0.1:8081";
 const PROJECT_ROOT = process.env.AETHER_PROJECT ?? process.cwd();
-const TOKEN_BUDGET = Number.parseInt(process.env.TOKEN_BUDGET ?? "16384", 10);
+
+/**
+ * Budget du contexte *volatil* injecté en queue de prompt.
+ *
+ * Il n'est plus de 16 384 : mesuré sur M1 Max, le préfill coûte ~3,6 ms par token
+ * (58 s de TTFT à 16 k tokens). Ce bloc change à chaque tour, il est donc
+ * effectivement repayé à chaque tour. 4 096 tokens ≈ 15 s de prefill au pire.
+ */
+const TOKEN_BUDGET = Number.parseInt(
+  process.env.TOKEN_BUDGET ?? "4096",
+  10,
+);
+
+// Upstream URL: env var > saved config > default MLX port
+const _GLOBAL_CONFIG_PATH = path.join(os.homedir(), ".aether", "config.json");
+const _savedCfg = (() => {
+  try { return JSON.parse(fs.readFileSync(_GLOBAL_CONFIG_PATH, "utf8")); } catch { return {}; }
+})();
+const OLLAMA_URL: string =
+  process.env.OLLAMA_URL ??
+  (_savedCfg.upstreamUrl as string | undefined) ??
+  "http://127.0.0.1:8000"; // oMLX default port
+console.log(`[Config] Upstream LLM: ${OLLAMA_URL}`);
+console.log(`[Config] Contexte volatil: ${TOKEN_BUDGET} tokens max`);
 
 let lastStats = {
   astTime: 0,
@@ -205,8 +232,9 @@ const computeP50 = (arr: number[]): number => {
   return sorted[Math.floor(sorted.length * 0.5)] ?? 0;
 };
 
-// ─── Token counting (tiktoken fallback) ──────────────────────────────────────
+// ─── Token counting (tiktoken) ───────────────────────────────────────────────
 let _tiktokenModule: any = null;
+let _encoder: any = null;
 
 const ensureTiktoken = async (): Promise<any> => {
   if (_tiktokenModule) return _tiktokenModule;
@@ -220,27 +248,45 @@ const ensureTiktoken = async (): Promise<any> => {
   }
 };
 
+/**
+ * Encodeur mémorisé.
+ *
+ * Deux bugs corrigés ici :
+ *  1. `encoding_for_model("Qwen3.6-35B-A3B-…")` **lève** (tiktoken ne connaît que
+ *     les noms OpenAI) ; l'exception était avalée par le `catch` et le comptage
+ *     retombait silencieusement sur l'heuristique `length / 4`. Autrement dit, le
+ *     « vrai comptage tiktoken » de la Phase 2 ne servait jamais pour ce modèle.
+ *  2. L'encodeur WASM était recréé puis libéré à **chaque** appel (`enc.free()`),
+ *     soit ~30 allocations par requête sur 30 chunks. Il est créé une seule fois.
+ *
+ * Limite connue : cl100k_base n'est pas le tokenizer de Qwen (vocab 248 320). Le
+ * comptage reste une approximation, mais *stable* et bornée, au lieu d'un
+ * `length / 4` silencieux.
+ */
+const getEncoder = async (): Promise<any> => {
+  if (_encoder) return _encoder;
+  const mod = await ensureTiktoken();
+  if (!mod) return null;
+  try {
+    if (typeof mod.get_encoding === "function") {
+      _encoder = mod.get_encoding("cl100k_base");
+    } else if (typeof mod.encoding_for_model === "function") {
+      _encoder = mod.encoding_for_model("gpt-3.5-turbo");
+    }
+  } catch {
+    _encoder = null;
+  }
+  return _encoder;
+};
+
 const countTokensText = async (
   text: string,
-  model?: string,
+  _model?: string,
 ): Promise<number> => {
-  const mod = await ensureTiktoken();
-  if (!mod) return Math.trunc(text.length / 4);
+  const enc = await getEncoder();
+  if (!enc) return Math.trunc(text.length / 4);
   try {
-    let enc: any;
-    if (typeof mod.encoding_for_model === "function") {
-      enc = mod.encoding_for_model(model ?? "gpt-3.5-turbo");
-    } else if (typeof mod.get_encoding === "function") {
-      enc = mod.get_encoding("cl100k_base");
-    } else {
-      return Math.trunc(text.length / 4);
-    }
-    const arr = enc.encode(text);
-    const len = arr.length;
-    try {
-      enc.free?.();
-    } catch {}
-    return len;
+    return enc.encode(text).length;
   } catch {
     return Math.trunc(text.length / 4);
   }
@@ -262,17 +308,6 @@ const countTokensForMessages = async (
 };
 
 // ─── Aether daemon socket client ─────────────────────────────────────────────
-
-interface AetherContextResponse {
-  tokenCount: number;
-  confidence: number;
-  sections: { astContext?: string; ragContext?: string };
-  meta: {
-    astFiles: string[];
-    reasoning: "think" | "no_think";
-    budgetUsed: { ast: number; rag: number; history: number };
-  };
-}
 
 interface AetherDaemonStatusResponse {
   filesIndexed: number;
@@ -331,11 +366,44 @@ const pushEntries = (dirPath: string, stack: string[]): void => {
   }
 };
 
-const requestAetherContext = (
-  taskText: string,
-  activeFilePath?: string,
-  cursorLine?: number,
-): Promise<AetherContextResponse | null> => {
+/**
+ * Budgets maximaux accordés au daemon. Le daemon ne doit JAMAIS bloquer le TTFT.
+ *
+ * C'était 60 s (« to cover Reranker cold-starts ») : un cold-start du reranker
+ * ajoutait donc jusqu'à une minute au TTFT, dans le chemin de la requête. Le
+ * reranker n'attend plus (voir daemon.ts) ; ce budget n'a plus à couvrir que la
+ * récupération à chaud (embedding + rerank ≤ 1,5 s + comptage du budget).
+ * Au-delà, on préfère envoyer le prompt sans contexte Aether que faire attendre.
+ */
+const CONTEXT_TIMEOUT_MS = Number.parseInt(
+  process.env.AETHER_CONTEXT_TIMEOUT_MS ?? "3000",
+  10,
+);
+/** La repo-map est calculée en mémoire par le daemon : réponse quasi immédiate. */
+const REPO_MAP_TIMEOUT_MS = Number.parseInt(
+  process.env.AETHER_REPO_MAP_TIMEOUT_MS ?? "2000",
+  10,
+);
+
+interface RepoMapResponse {
+  text: string;
+  version: string;
+  files: number;
+  symbols: number;
+  truncated: boolean;
+}
+
+/**
+ * Interroge le daemon sur son socket Unix et attend une réponse typée.
+ * Toujours borné : c'est le seul contrat qui garantit que le pré-processing
+ * d'Aether ne s'ajoute pas au TTFT de façon non déterministe.
+ */
+const askDaemon = <T>(
+  requestType: string,
+  responseType: string,
+  payload: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<T | null> => {
   return new Promise((resolve) => {
     const sockPath = getSocketPath();
     if (!fs.existsSync(sockPath)) {
@@ -345,25 +413,34 @@ const requestAetherContext = (
 
     const socket = createConnection(sockPath);
     let buffer = "";
-    const timeout = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    let done = false;
+
+    const finish = (value: T | null): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
       socket.destroy();
-      resolve(null);
-    }, 15000);
+      resolve(value);
+    };
 
-    const payload = JSON.stringify({
-      id: `gw-${Date.now()}`,
-      type: "context:request",
-      version: "1.0",
-      ts: Date.now(),
-      payload: { 
-        taskText, 
-        activeFilePath,
-        cursorLine,
-        tokenBudget: TOKEN_BUDGET 
-      },
-    });
+    timer = setTimeout(() => {
+      console.warn(`[gateway] ${requestType} non rendu en ${timeoutMs} ms — poursuite sans.`);
+      finish(null);
+    }, timeoutMs);
 
-    socket.on("connect", () => socket.write(payload + "\n"));
+    socket.on("connect", () =>
+      socket.write(
+        JSON.stringify({
+          id: `gw-${requestType}-${Date.now()}`,
+          type: requestType,
+          version: "1.0",
+          ts: Date.now(),
+          payload,
+        }) + "\n",
+      ),
+    );
+
     socket.on("data", (chunk) => {
       buffer += chunk.toString();
       const lines = buffer.split("\n");
@@ -371,23 +448,80 @@ const requestAetherContext = (
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          if (msg.type === "context:response") {
-            clearTimeout(timeout);
-            socket.destroy();
-            resolve(msg.payload as AetherContextResponse);
+          if (msg.type === responseType) {
+            finish(msg.payload as T);
             return;
           }
         } catch {
-          /* incomplete chunk, wait for more */
+          /* chunk incomplet, on attend la suite */
         }
       }
       buffer = lines.at(-1) ?? "";
     });
-    socket.on("error", () => {
-      clearTimeout(timeout);
-      resolve(null);
-    });
+
+    socket.on("error", () => finish(null));
   });
+};
+
+const requestAetherContext = (
+  taskText: string,
+  activeFilePath?: string,
+  ideFiles?: string[],
+  cursorLine?: number,
+): Promise<AetherContextResponse | null> =>
+  askDaemon<AetherContextResponse>(
+    "context:request",
+    "context:response",
+    { taskText, activeFilePath, ideFiles, cursorLine, tokenBudget: TOKEN_BUDGET },
+    CONTEXT_TIMEOUT_MS,
+  );
+
+// ─── Repo-map : bloc stable du préfixe ────────────────────────────────────────
+//
+// La carte des signatures ne change que si le code change. Elle est donc placée
+// dans le PRÉFIXE (juste après le prompt système) : préfillée une fois, réutilisée
+// ensuite par le cache de blocs d'oMLX.
+//
+// Elle n'est rafraîchie qu'après une période d'inactivité, jamais pendant une
+// session agentique : un changement de carte au milieu de l'historique
+// invaliderait tout le préfixe et rejouerait un prefill complet.
+
+const REPO_MAP_TOKEN_BUDGET = Number.parseInt(
+  process.env.AETHER_REPO_MAP_TOKENS ?? "1500",
+  10,
+);
+const REPO_MAP_IDLE_MS = Number.parseInt(
+  process.env.AETHER_REPO_MAP_IDLE_MS ?? "60000",
+  10,
+);
+
+let repoMapCache: { text: string; version: string; fetchedAt: number } | null = null;
+let lastForwardAt = 0;
+
+const ensureRepoMap = async (): Promise<string | undefined> => {
+  const now = Date.now();
+  const idle = now - lastForwardAt > REPO_MAP_IDLE_MS;
+  const stale = !repoMapCache || now - repoMapCache.fetchedAt > REPO_MAP_IDLE_MS;
+
+  if (idle && stale) {
+    const fresh = await askDaemon<RepoMapResponse>(
+      "repo:map",
+      "repo:map:response",
+      { tokenBudget: REPO_MAP_TOKEN_BUDGET },
+      REPO_MAP_TIMEOUT_MS,
+    );
+    if (fresh) {
+      const changed = repoMapCache?.version !== fresh.version;
+      repoMapCache = { text: fresh.text, version: fresh.version, fetchedAt: now };
+      console.log(
+        `[gateway] repo-map ${changed ? "mise à jour" : "inchangée"} : ` +
+          `${fresh.files} fichiers, ${fresh.symbols} symboles, v${fresh.version}` +
+          `${fresh.truncated ? " (tronquée)" : ""}`,
+      );
+    }
+  }
+
+  return repoMapCache?.text || undefined;
 };
 
 const requestAetherDaemonStatus = (): Promise<AetherDaemonStatusResponse | null> => {
@@ -440,21 +574,46 @@ const requestAetherDaemonStatus = (): Promise<AetherDaemonStatusResponse | null>
   });
 };
 
-// ─── Extract task from IDE messages ──────────────────────────────────────────
+// ─── Text extraction helpers ──────────────────────────────────────────────────
 
+/**
+ * Flatten any content value (string or OpenAI parts array) to a plain string.
+ * Strips KiloCode noise tags from the result.
+ */
+const KILOCODE_NOISE_TAGS = [
+  /<environment_details>[\s\S]*?<\/environment_details>/gi,
+  /<open_tabs>[\s\S]*?<\/open_tabs>/gi,
+  /<workspace_items>[\s\S]*?<\/workspace_items>/gi,
+  /<file_content[^>]*>[\s\S]*?<\/file_content>/gi,
+];
+
+const extractPureText = (content: unknown): string => {
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .filter((p) => (p as { type?: string }).type === "text")
+      .map((p) => (p as { text?: string }).text ?? "")
+      .join("\n");
+  }
+  for (const re of KILOCODE_NOISE_TAGS) {
+    text = text.replace(re, "");
+  }
+  return text.trim();
+};
+
+/**
+ * Extract the last user-facing task text (≤ 500 chars) for RAG/AST querying.
+ */
 const extractTaskText = (
   messages: Array<{ role: string; content: unknown }>,
 ): string => {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "user") continue;
-    if (typeof msg.content === "string") return msg.content.slice(0, 500);
-    if (Array.isArray(msg.content)) {
-      const textPart = (
-        msg.content as Array<{ type: string; text?: string }>
-      ).find((p) => p.type === "text");
-      if (textPart?.text) return textPart.text.slice(0, 500);
-    }
+    const text = extractPureText(msg.content);
+    if (text) return text.slice(0, 500);
   }
   return "";
 };
@@ -597,6 +756,7 @@ export interface ContextEngineeringResult {
   blocksDropped: number;
   blockTypesSummary: string;
   activeFilePath: string | undefined;
+  ideFiles: string[];
   cursorLine: number | undefined;
 }
 
@@ -604,155 +764,73 @@ const engineerContext = (
   messages: Array<{ role: string; content: unknown }>
 ): ContextEngineeringResult => {
   let tokensRaw = 0;
-  let tokensEngineered = 0;
-  let blocksDropped = 0;
-  const typeCounts: Record<string, number> = {};
 
-  // Find cursor info and active file path in all system messages first
-  let activeFilePath: string | undefined = undefined;
-  let globalCursorLine: number | null = null;
-  
+  // Mesure le raw total
   for (const m of messages) {
-    if (m.role !== 'system') continue;
+    const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+    tokensRaw += estimateBlockTokens(c);
+  }
+
+  // Extraire curseur + chemin du fichier actif en scannant TOUT le payload
+  let activeFilePath: string | undefined;
+  let cursorLine: number | undefined;
+
+  for (const m of messages) {
     const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-    
-    // Detect cursor
-    const extractedCursorLine = extractCursorLineFromContent(c);
-    if (extractedCursorLine !== undefined) {
-      globalCursorLine = extractedCursorLine;
-    }
-    
-    // Detect active file path from tags or environment
-    const pathMatch = /active file:? ([^\s]+)/i.exec(c)
-      ?? /<file_content[^>]*path=["']?([^"'\s>]+)["']?/i.exec(c);
-    if (pathMatch?.[1]) {
-      activeFilePath = pathMatch[1];
+
+    // Detection du curseur
+    const cl = extractCursorLineFromContent(c);
+    if (cl !== undefined) cursorLine = cl;
+
+    // Detection du fichier actif (plusieurs patterns pour KiloCode)
+    // On split par espace ou retour à la ligne immédiatement pour ne garder que le chemin
+    const pm = /active file:?\s*([^\s\n\r\t]+)/i.exec(c)
+      ?? /<file_content[^>]*path=["']?([^"'\s>\n]+)["']?/i.exec(c)
+      ?? /Active file:\s*([^\s\n\r\t]+)/i.exec(c);
+
+    if (pm?.[1]) {
+      // Nettoyage radical : on prend tout jusqu'au premier caractère non-chemin
+      const cleanPath = pm[1].split(/[\\n\\r\\t\s]/)[0];
+      if (cleanPath) {
+        activeFilePath = cleanPath.replace(/^aether\//, "").trim();
+      }
     }
   }
 
-  // Classify all system blocks
-  let sysIndex = 0;
-  const processedMessages = messages.map(msg => {
-    const contentStr =
-      typeof msg.content === 'string'
-        ? msg.content
-        : JSON.stringify(msg.content ?? '');
+  // NUKE: KiloCode envoie souvent des dizaines de messages 'system' avec des arbres de fichiers.
+  // On ne garde que le TOUT PREMIER message system (les instructions de base)
+  // et les messages de conversation réels.
+  const firstSystem = messages.find(m => m.role === 'system');
+  const conversationOnly = messages.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool');
 
-    tokensRaw += estimateBlockTokens(contentStr);
+  // On limite l'historique à 10 messages pour éviter l'explosion à 44k tokens
+  const history = conversationOnly.slice(-10);
+  const kept = [...(firstSystem ? [firstSystem] : []), ...history];
 
-    if (msg.role !== 'system') {
-      tokensEngineered += estimateBlockTokens(contentStr);
-      return { msg, keep: true, content: contentStr };
-    }
-
-    const block = classifySystemBlock(contentStr, sysIndex++);
-    typeCounts[block.type] = (typeCounts[block.type] ?? 0) + 1;
-
-    if (!block.keep) {
-      blocksDropped++;
-      return { msg, keep: false, content: '' };
-    }
-
-    // Apply Compaction (Stage 3) - Only if we don't have Surgical AST logic ready
-    let finalContent = block.compacted ?? block.content;
-    
-    // If it's a file content, we might drop it if we rely on Surgical Daemon injection
-    if (block.type === 'active_file' || block.type === 'other_file') {
-      // In surgical mode, we drop the IDE's version of the file content
-      // to avoid massive redundancy. The Daemon will inject the surgical version.
-      blocksDropped++;
-      return { msg, keep: false, content: '' };
-    }
-
-    tokensEngineered += estimateBlockTokens(finalContent);
-    // To enable Prefix Caching in MLX, only keep the 'persona' block as 'system'.
-    // Convert all other environment/context blocks to 'user' messages.
-    const role = block.type === 'persona' ? 'system' : 'user';
-    return { msg: { ...msg, role, content: finalContent }, keep: true, content: finalContent };
-  });
-
-  const filteredMessages = processedMessages
-    .filter(p => p.keep)
-    .map(p => p.msg);
-
-  const typesSummary = Object.entries(typeCounts)
-    .map(([k, v]) => `${k}:${v}`).join(' ');
+  const tokensEngineered = kept.reduce((sum, m) => {
+    const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+    return sum + estimateBlockTokens(c);
+  }, 0);
 
   return {
-    messages: filteredMessages,
+    messages: kept,
     tokensRaw,
     tokensEngineered,
-    blocksDropped,
-    blockTypesSummary: typesSummary,
+    blocksDropped: messages.length - kept.length,
+    blockTypesSummary: `kept:${kept.length}`,
     activeFilePath,
-    cursorLine: globalCursorLine ?? undefined
+    ideFiles: [],
+    cursorLine,
   };
 };
 
 
-// ─── Context injection ────────────────────────────────────────────────────────
-
-const injectAetherContext = (
-  messages: Array<{ role: string; content: unknown }>,
-  ctx: AetherContextResponse,
-): Array<{ role: string; content: unknown }> => {
-  const parts: string[] = [
-    ...(ctx.meta.reasoning === "think" ? ["/think"] : []),
-    ...(ctx.sections.astContext
-      ? [
-          "<aether_context>",
-          ctx.sections.astContext,
-          ...(ctx.sections.ragContext ? [ctx.sections.ragContext] : []),
-          "</aether_context>",
-        ]
-      : []),
-  ];
-
-  if (parts.length === 0) return messages;
-
-  const aetherMsg = {
-    role: "user",
-    content: parts.join("\n"),
-  };
-
-  const firstSystemIdx = messages.findIndex((m) => m.role === "system");
-  const insertAt = firstSystemIdx >= 0 ? firstSystemIdx + 1 : 0;
-
-  return [
-    ...messages.slice(0, insertAt),
-    aetherMsg,
-    ...messages.slice(insertAt),
-  ];
-};
-
-// ─── Tool shaping ─────────────────────────────────────────────────────────────
-
-const IO_TOOL_PATTERNS =
-  /^(read_file|write_file|list_dir|web_search|browser|fetch|http)/i;
-const TASK_ACTION_REGEX =
-  /\b(create|write|file|search|fetch|open)\b/i;
-
-const shapeTools = (
-  tools: unknown[] | undefined,
-  taskText: string,
-): unknown[] | undefined => {
-  if (tools?.length) {
-    if (TASK_ACTION_REGEX.test(taskText)) return tools;
-
-    const filtered = tools.filter((t: unknown) => {
-      const name =
-        (t as { function?: { name?: string }; name?: string })?.function
-          ?.name ??
-        (t as { name?: string })?.name ??
-        "";
-      return !IO_TOOL_PATTERNS.test(name);
-    });
-
-    return filtered.length > 0 ? filtered : undefined;
-  }
-
-  return tools;
-};
+// ─── Clean payload builder ────────────────────────────────────────────────────
+//
+// L'assemblage du payload est délégué à ./payload.ts (module pur, testé par
+// payload.test.ts) : préfixe stable, suffixe volatil, outils préservés. C'est ce
+// qui remplace injectAetherContext, dont l'insertion juste après le message
+// système invalidait le cache de préfixe d'oMLX à chaque tour.
 
 // ─── Forward to Ollama with SSE streaming ─────────────────────────────────────
 
@@ -762,16 +840,55 @@ const forwardToOllama = async (
   tStart: number,
   aetherCtx: any = null
 ): Promise<void> => {
-  const res = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  // MLX typically uses the model loaded at startup, but some versions require a match.
+  // We keep the model name from the payload (or "default") to satisfy the server's validation.
+  if (!payload.model) payload.model = "default";
+
+  const messages = (payload.messages as any[]) || [];
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  console.log(`[payload-debug] last user msg: ${JSON.stringify(lastUser?.content)?.slice(0, 300)}`);
+  console.log(`[payload-debug] total messages: ${messages.length}, model: ${payload.model}`);
+
+  // Add Authorization header for oMLX (uses 'abcde' by default)
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (OLLAMA_URL.includes("8000") || OLLAMA_URL.includes("localhost")) {
+    headers['Authorization'] = 'Bearer abcde';
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+    console.error("[gateway] ⏱️ Generation timeout after 240s");
+  }, 240_000);
+
+  let res: Response;
+  try {
+    res = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
+      method: "POST",
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify(payload),
+    });
+    clearTimeout(timeoutId);
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err.name === "AbortError") {
+      return reply.status(504).send({
+        error: { message: "Generation timed out after 240s", type: "timeout" }
+      });
+    }
+    throw err;
+  }
 
   // Restore SSE headers
   reply.header("Content-Type", "text/event-stream");
-  reply.header("Cache-Control", "no-cache");
+  reply.header("Cache-Control", "no-cache, no-transform");
   reply.header("X-Accel-Buffering", "no");
+  if (reply.raw.setNoDelay) {
+    reply.raw.setNoDelay(true);
+  }
 
   let tokenCount = 0;
   let tFirstToken = 0;
@@ -912,10 +1029,16 @@ fastify.get("/v1/models", async () => ({
   object: "list",
   data: [
     {
-      id: "aether-gateway",
+      id: "qwen3.6-35b-aether",
       object: "model",
       created: Math.floor(Date.now() / 1000),
       owned_by: "aether",
+    },
+    {
+      id: "/Users/beij/models/Qwen3.6-35B-A3B-RotorQuant-MLX-8bit",
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: "mlx",
     },
   ],
 }));
@@ -1002,34 +1125,31 @@ fastify.post("/v1/chat/completions", async (request, reply: any) => {
     let aetherCtx = null;
     if (taskText) {
       const tContext_start = Date.now();
-      aetherCtx = await requestAetherContext(taskText, ctxResult.activeFilePath, ctxResult.cursorLine);
+      aetherCtx = await requestAetherContext(taskText, ctxResult.activeFilePath, ctxResult.ideFiles, ctxResult.cursorLine);
       lastStats.astTime = Date.now() - tContext_start;
     }
     
-    const enrichedMessages = aetherCtx
-      ? injectAetherContext(strippedMessages, aetherCtx)
-      : strippedMessages;
-      
-    tokensAfter = await countTokensForMessages(enrichedMessages, modelName);
-    
-    // Enforce TOKEN_BUDGET
-    while (tokensAfter > TOKEN_BUDGET && enrichedMessages.length > 2) {
-      enrichedMessages.splice(1, 1);
-      tokensAfter = await countTokensForMessages(enrichedMessages, modelName);
+    // Repo-map : bloc stable du préfixe (rafraîchie uniquement hors session).
+    const repoMap = await ensureRepoMap();
+    lastForwardAt = Date.now();
+
+    // Le « context engineering » est réellement appliqué : on repart des messages
+    // filtrés (strippedMessages), pas des messages bruts. Auparavant le filtrage
+    // n'était calculé que pour la télémétrie et n'était jamais envoyé.
+    const forwardPayload = buildCleanPayload(body, aetherCtx, strippedMessages, stream, { repoMap });
+
+    // Les outils sont transmis au modèle. Sans eux, un agent ne peut ni lire ni
+    // écrire de fichier : le modèle est réduit à produire du texte.
+    if (shapedTools?.length) {
+      forwardPayload.tools = shapedTools;
+    } else {
+      delete forwardPayload.tools;
     }
 
-    const forwardPayload: Record<string, unknown> = {
-      ...body,
-      messages: enrichedMessages,
-      stream,
-      keep_alive: -1,
-    };
-    
-    if (shapedTools == null) {
-      delete forwardPayload.tools;
-    } else {
-      forwardPayload.tools = shapedTools;
-    }
+    tokensAfter = await countTokensForMessages(
+      forwardPayload.messages as Array<{ role: string; content: unknown }>,
+      modelName,
+    );
 
     await forwardToOllama(forwardPayload, reply as unknown, t0, aetherCtx);
   } catch (err) {
@@ -1137,10 +1257,11 @@ const CONFIG_PATH = path.join(
 fastify.get("/aether/config", async () => {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
-      return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      return { modelPath: "", tokenBudget: TOKEN_BUDGET, upstreamUrl: OLLAMA_URL, ...cfg };
     }
   } catch {}
-  return { modelPath: "", tokenBudget: TOKEN_BUDGET };
+  return { modelPath: "", tokenBudget: TOKEN_BUDGET, upstreamUrl: OLLAMA_URL };
 });
 
 fastify.post("/aether/config", async (request) => {
@@ -1170,6 +1291,74 @@ let mlxProcess: ChildProcess | null = null;
 let coreProcess: ChildProcess | null = null;
 let rerankerProcess: ChildProcess | null = null;
 let engineStatus: "stopped" | "starting" | "running" = "stopped";
+const log = (tag: string, msg: string) => addLog(`[${tag}] ${msg}`);
+
+function findExecutable(name: string): string {
+  try {
+    const extendedPath = `/opt/homebrew/bin:/usr/local/bin:${process.env.HOME}/.local/bin:/Applications/oMLX.app/Contents/MacOS:${process.env.PATH}`;
+    const res = spawnSync("which", [name], {
+      env: { ...process.env, PATH: extendedPath },
+      encoding: "utf8"
+    });
+    const foundPath = res.stdout?.trim();
+    if (foundPath && fs.existsSync(foundPath)) {
+      return foundPath;
+    }
+    return name;
+  } catch {
+    return name;
+  }
+}
+
+/**
+ * Résout le binaire oMLX.
+ *
+ * Le bundle oMLX installe `omlx-cli` (pas `omlx`) : l'ancienne recherche
+ * `findExecutable("omlx")` échouait donc toujours et le moteur n'était jamais
+ * démarré.
+ */
+function resolveOmlxBinary(): string | null {
+  // Chemin explicite prioritaire : variable d'environnement, puis configuration.
+  // (Le message d'erreur du démarrage promettait cette clé sans qu'elle soit lue.)
+  const fromEnv = process.env.AETHER_OMLX_BINARY;
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as { omlxBinary?: string };
+    if (cfg.omlxBinary && fs.existsSync(cfg.omlxBinary)) return cfg.omlxBinary;
+  } catch {
+    /* pas de configuration : on continue avec la détection automatique */
+  }
+
+  const candidates = [
+    `${process.env.HOME ?? ""}/.local/bin/omlx-cli`,
+    "/opt/homebrew/bin/omlx-cli",
+    "/usr/local/bin/omlx-cli",
+    "/Applications/oMLX.app/Contents/MacOS/omlx-cli",
+    "omlx-cli",
+    "omlx",
+  ];
+  for (const candidate of candidates) {
+    if (candidate.startsWith("/")) {
+      if (fs.existsSync(candidate)) return candidate;
+      continue;
+    }
+    const found = findExecutable(candidate);
+    if (found !== candidate) return found;
+  }
+  return null;
+}
+
+async function isPortAlive(url: string): Promise<boolean> {
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(1500)
+    });
+    return res.ok || res.status === 401; // 401 is OK for oMLX if key missing
+  } catch {
+    return false;
+  }
+}
+
 const engineLogs: string[] = [];
 
 const addLog = (msg: string) => {
@@ -1224,22 +1413,96 @@ fastify.post("/aether/engine/start", async () => {
   // ─────────────────────────────────────────────────────────────────────────
   
   const config = fs.existsSync(CONFIG_PATH) ? JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) : {};
-  const modelPath = config.modelPath || "/Users/beij/models/Qwen3.6-35B-A3B-RotorQuant-MLX-8bit";
-  
-  console.log("[Engine] Starting MLX server...");
-  addLog("[System] Starting MLX Server...");
-  mlxProcess = spawn("python", ["-m", "mlx_lm.server", "--model", modelPath, "--port", "8081"], {
-    detached: true,
-  });
-  mlxProcess.stdout?.on('data', (d) => addLog(`[MLX] ${d.toString()}`));
-  mlxProcess.stderr?.on('data', (d) => addLog(`[MLX] ${d.toString()}`));
-  mlxProcess.on('exit', () => addLog(`[System] MLX Server exited.`));
-  
+  const modelPath: string = config.modelPath ?? "";
+  const modelsDir: string =
+    config.modelsDir || (modelPath ? path.dirname(modelPath) : path.join(os.homedir(), "models"));
+
+  const startMLX = (cmd: string, args: string[]) => {
+    const proc = spawn(cmd, args, {
+      detached: true,
+      shell: false,
+      env: { ...process.env, HF_HUB_OFFLINE: "1" }
+    });
+
+    proc.on('error', (err: any) => {
+      addLog(`[System] ❌ Error starting oMLX (${cmd}): ${err.message}`);
+    });
+
+    proc.stdout?.on('data', (d) => addLog(`[MLX] ${d.toString()}`));
+    proc.stderr?.on('data', (d) => addLog(`[MLX] ${d.toString()}`));
+    proc.on('exit', (code) => addLog(`[System] oMLX exited (code: ${code}).`));
+    return proc;
+  };
+
+  // 1. Try to start oMLX if not already alive
+  const omlxAlive = await isPortAlive("http://127.0.0.1:8000/v1/models");
+
+  if (omlxAlive) {
+    log("System", "✅ oMLX already running on port 8000 — skipping launch");
+  } else {
+    log("System", "Starting oMLX engine...");
+    const omlxBinary = resolveOmlxBinary();
+
+    if (!omlxBinary) {
+      addLog(
+        "[System] ❌ omlx-cli introuvable. Installe oMLX.app, ou renseigne son chemin absolu dans ~/.aether/config.json (clé « omlxBinary »).",
+      );
+    } else {
+      // Cache de préfixe paginé sur SSD : c'est LE levier de TTFT d'oMLX.
+      // Désactivé par défaut (`PagedSSDCacheConfig.enabled = False`), il doit
+      // être activé explicitement par --paged-ssd-cache-dir.
+      const cacheDir: string =
+        config.cacheDir || path.join(os.homedir(), ".omlx", "cache");
+      try {
+        fs.mkdirSync(cacheDir, { recursive: true });
+      } catch (err) {
+        addLog(`[System] ⚠️  Impossible de créer ${cacheDir}: ${String(err)}`);
+      }
+
+      log("System", `oMLX → ${omlxBinary}`);
+      log("System", `Modèles: ${modelsDir} | cache préfixe: ${cacheDir}`);
+
+      mlxProcess = startMLX(omlxBinary, [
+        "serve",
+        "--model-dir", modelsDir,
+        "--port", "8000",
+        "--host", "127.0.0.1",
+        "--paged-ssd-cache-dir", cacheDir,
+        "--paged-ssd-cache-max-size", String(config.cacheMaxSize ?? "100GB"),
+        "--hot-cache-max-size", String(config.hotCacheMaxSize ?? "8GB"),
+        // Le cache de préfixe d'oMLX fonctionne par blocs de 256 tokens :
+        // 256 blocs = 65 536 tokens seulement. Pour un contexte de 128 k il faut
+        // 512 blocs, sinon la table sature et le cache évince prématurément —
+        // ce qui se paie directement en TTFT.
+        "--initial-cache-blocks", String(config.initialCacheBlocks ?? 512),
+        // oMLX 0.7.0 a REMPLACÉ --max-process-memory (disparu, rejeté par
+        // argparse) par --memory-guard {off,safe,balanced,aggressive}.
+        "--memory-guard", String(config.memoryGuard ?? "balanced"),
+      ]);
+    }
+  }
+
+  // 2. Try to start Reranker if not already alive
+  const rerankerAlive = await isPortAlive("http://127.0.0.1:8082/health");
+  if (rerankerAlive) {
+    log("System", "✅ Reranker already running on port 8082 — skipping launch");
+  } else {
+    log("System", "Starting Reranker Server...");
+    const rootDir = path.resolve(__dirname, "../../../");
+    rerankerProcess = spawn("python", ["packages/core/reranker_server.py"], {
+      cwd: rootDir,
+      detached: true,
+      env: { ...process.env, HF_HUB_OFFLINE: "1" }
+    });
+    rerankerProcess.stdout?.on('data', (d) => addLog(`[Reranker] ${d.toString()}`));
+    rerankerProcess.stderr?.on('data', (d) => addLog(`[Reranker] ${d.toString()}`));
+  }
+
   console.log("[Engine] Starting Core Daemon...");
   addLog("[System] Starting Core Daemon...");
   const rootDir = path.resolve(__dirname, "../../../");
   const daemonScript = path.resolve(rootDir, "packages/core/dist/daemon.js");
-  
+
   if (fs.existsSync(daemonScript)) {
     coreProcess = spawn(process.execPath, [daemonScript, PROJECT_ROOT], {
       detached: true,
@@ -1251,21 +1514,6 @@ fastify.post("/aether/engine/start", async () => {
   } else {
     addLog("[System] ❌ Core daemon not found — run: npm run build --workspace=packages/core");
     console.error("[Engine] Core daemon not found:", daemonScript);
-  }
-
-  console.log("[Engine] Starting Reranker Server...");
-  addLog("[System] Starting Reranker Server...");
-  const rerankerScript = path.resolve(rootDir, "packages/reranker/reranker_server.py");
-  if (fs.existsSync(rerankerScript)) {
-    rerankerProcess = spawn("python", [rerankerScript], {
-      detached: true,
-      cwd: rootDir
-    });
-    rerankerProcess.stdout?.on('data', (d) => addLog(`[Reranker] ${d.toString()}`));
-    rerankerProcess.stderr?.on('data', (d) => addLog(`[Reranker] ${d.toString()}`));
-    rerankerProcess.on('exit', (code) => addLog(`[System] Reranker Server exited (code: ${code}).`));
-  } else {
-    addLog("[System] ❌ Reranker script not found.");
   }
 
   void (async () => {

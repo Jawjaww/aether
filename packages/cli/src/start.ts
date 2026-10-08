@@ -63,7 +63,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
   const {
     projectPath,
     port = 8080,
-    ollamaUrl = "http://127.0.0.1:11434",
+    ollamaUrl = "http://127.0.0.1:8000",
     timeout = 8000,
   } = opts;
 
@@ -175,6 +175,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
       AETHER_PROJECT: projectPath,
       AETHER_PORT: String(port),
       OLLAMA_URL: ollamaUrl,
+      HF_HUB_OFFLINE: "1",
     },
     cwd: projectPath,
   });
@@ -193,7 +194,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
   console.log(`\n  ⚡ Starting gateway (PID: ${child.pid})`);
   console.log(`     Project   →  ${projectPath}`);
   console.log(`     Gateway   →  http://127.0.0.1:${port}/v1`);
-  console.log(`     Ollama    →  ${ollamaUrl}`);
+  console.log(`     LLM       →  ${ollamaUrl}`);
   console.log(`\n  ⏳ Waiting for the gateway to respond…`);
 
   const ok = await waitForGateway(port, timeout);

@@ -69,11 +69,15 @@ export const rerank = async (
   if (documents.length === 0) return { results: [], fallback: false };
 
   try {
+    // Budget strict : le reranker est une optimisation de précision, pas une
+    // dépendance dure. Il est appelé dans le chemin du TTFT ; au-delà de cette
+    // limite on préfère l'ordre du graphe AST à 8 s d'attente.
+    const timeoutMs = Number.parseInt(process.env.AETHER_RERANK_TIMEOUT_MS ?? "1500", 10);
     const response = await fetch("http://127.0.0.1:8082/rerank", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query, documents }),
-      signal: AbortSignal.timeout(8000), // 8 s hard timeout
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     if (!response.ok) {

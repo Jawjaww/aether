@@ -17,8 +17,11 @@ import {
   removeFileFromGraph,
   updateGraphMetrics,
   upsertFileInGraph,
+  INDEXED_EXTENSIONS,
+  type ASTChunk,
 } from "./indexer/ast-extractor.js"
 import type { ASTGraph } from "./indexer/ast-extractor.js"
+import { buildRepoMap } from "./indexer/repo-map.js"
 import { deleteFile as deleteRAGFile, initRAG, indexFile, searchRAG } from "./indexer/rag-indexer.js"
 import { applyBudget, estimateTokens } from "./budget/budget-engine.js"
 import type { BudgetChunk } from "./budget/budget-engine.js"
@@ -38,11 +41,11 @@ import {
 const PROJECT_ROOT = process.argv[2] ?? process.cwd()
 const hash         = createHash("sha256").update(path.resolve(PROJECT_ROOT)).digest("hex").slice(0, 8)
 const SOCK_PATH    = path.join(os.homedir(), ".aether", "projects", hash, "aether.sock")
-const DEFAULT_TOKEN_BUDGET = 16384
+const DEFAULT_TOKEN_BUDGET = 4096
 const MAX_AST_RERANK_CANDIDATES = 15
 const MAX_RAG_RERANK_CANDIDATES = 15
 const CURRENT_AST_VERSION = 1
-const CURRENT_RAG_VERSION = 1
+const CURRENT_RAG_VERSION = 2 // Bumped to force re-index after port/auth fix
 const MANIFEST_FLUSH_DELAY_MS = 1500
 const INDEX_BATCH_SIZE = 6
 const INDEX_THROTTLE_MS = 120
@@ -76,6 +79,16 @@ const contextCache = new Map<string, CacheEntry>()
 const MAX_CACHE_SIZE = 50
 const MAX_PROJECTS_TRACKED = 100
 
+/**
+ * Compteur monotone, incrémenté à CHAQUE mutation de l'index (ajout, mise à jour,
+ * suppression de fichier).
+ *
+ * La clé de cache de session ne dépendait que du mtime du fichier **actif** : la
+ * modification d'un autre fichier — ou d'un fichier servant de candidat RAG —
+ * pouvait donc servir un contexte périmé pendant tout le TTL (5 minutes).
+ */
+let contentVersion = 0
+
 const makeCacheKey = (taskText: string, activeFilePath: string | undefined, tokenBudget: number): string => {
   let fileModifiedAt = 0
   if (activeFilePath) {
@@ -89,13 +102,10 @@ const makeCacheKey = (taskText: string, activeFilePath: string | undefined, toke
     } catch { /* ignore stat errors */ }
   }
   return createHash("sha1")
-    .update(`${taskText}\x00${activeFilePath ?? ""}\x00${tokenBudget}\x00${fileModifiedAt}`)
+    .update(
+      `${taskText}\x00${activeFilePath ?? ""}\x00${tokenBudget}\x00${fileModifiedAt}\x00${contentVersion}`,
+    )
     .digest("hex")
-}
-
-const getCacheProjectId = (key: string): string => {
-  const parts = key.split('\x00')
-  return parts[1] || PROJECT_ROOT
 }
 
 const purgeProjectCache = (projectId: string): void => {
@@ -352,6 +362,7 @@ const indexFileJob = async (job: IndexJob): Promise<void> => {
 
   if (job.reason === "DELETED") {
     removeFileFromGraph(absolutePath, graph);
+    contentVersion++;
     manifest.delete(relativePath);
     await deleteRAGFile(absolutePath);
     scheduleManifestFlush();
@@ -360,6 +371,7 @@ const indexFileJob = async (job: IndexJob): Promise<void> => {
 
   if (!fs.existsSync(absolutePath)) {
     removeFileFromGraph(absolutePath, graph);
+    contentVersion++;
     manifest.delete(relativePath);
     await deleteRAGFile(absolutePath);
     scheduleManifestFlush();
@@ -370,6 +382,7 @@ const indexFileJob = async (job: IndexJob): Promise<void> => {
   const chunk = extractFileFromSource(absolutePath, rawContent);
   if (!chunk) {
     removeFileFromGraph(absolutePath, graph);
+    contentVersion++;
     manifest.delete(relativePath);
     await deleteRAGFile(absolutePath);
     scheduleManifestFlush();
@@ -377,7 +390,12 @@ const indexFileJob = async (job: IndexJob): Promise<void> => {
   }
 
   upsertFileInGraph(chunk, graph);
-  await indexFile(absolutePath, rawContent);
+
+  contentVersion++;
+  const indexed = await indexFile(absolutePath, rawContent);
+  if (indexed.chunks === 0) {
+    console.warn(`[Aether] Aucun fragment RAG indexé pour ${relativePath} (fichier vide ?)`);
+  }
 
   const stat = await fsp.stat(absolutePath);
   updateFileMeta(
@@ -451,7 +469,7 @@ const scanProjectFiles = async (projectRoot: string): Promise<FileSnapshot[]> =>
           return;
         }
 
-        if (entry.isFile() && (name.endsWith(".ts") || name.endsWith(".tsx"))) {
+        if (entry.isFile() && INDEXED_EXTENSIONS.some((ext) => name.endsWith(ext))) {
           discovered.push(fullPath);
         }
       }),
@@ -554,6 +572,7 @@ const reconcileStartupIndex = async (): Promise<void> => {
     for (const deletedPath of deletedFiles) {
       const absolutePath = path.resolve(PROJECT_ROOT, deletedPath);
       removeFileFromGraph(absolutePath, graph);
+      contentVersion++;
       await deleteRAGFile(absolutePath);
       removeFileMeta(manifest, deletedPath);
     }
@@ -624,15 +643,58 @@ const buildAstCandidates = (
   return candidates;
 };
 
-const buildRagCandidates = async (taskText: string): Promise<RerankCandidate[]> => {
-  const ragResults = await searchRAG(taskText, 20);
-  return ragResults.map((result) => ({
-    id: `rag_${result.filePath}`,
-    text: result.content,
-    filePath: result.filePath,
-    isAST: false,
-    score: 0,
-  }));
+const buildRagCandidates = async (
+  taskText: string,
+): Promise<{ candidates: RerankCandidate[]; degraded: boolean; reason: string | undefined }> => {
+  const { results, degraded, reason } = await searchRAG(taskText, 20);
+
+  return {
+    degraded,
+    reason,
+    candidates: results.map((result, i) => ({
+      // Un fichier produit désormais PLUSIEURS fragments (un par plage de lignes) :
+      // l'id doit rester unique, sinon le budget les déduplique entre eux.
+      id: `rag_${result.filePath}_${result.startLine}_${i}`,
+      // L'en-tête donne au modèle de quoi citer des lignes précises.
+      text:
+        `// ${path.basename(result.filePath)}:${result.startLine}-${result.endLine}\n` +
+        result.content,
+      filePath: result.filePath,
+      isAST: false,
+      score: 0,
+    })),
+  };
+};
+
+/**
+ * Le reranker ne doit JAMAIS bloquer le chemin de la requête.
+ *
+ * L'ancienne implémentation attendait jusqu'à 45 s (polling toutes les 1,5 s) le
+ * démarrage à froid du cross-encoder, AVANT même d'envoyer le prompt au LLM :
+ * 45 s ajoutées au TTFT de la première requête. La santé est désormais suivie en
+ * tâche de fond ; en cas d'indisponibilité on retombe immédiatement sur l'ordre
+ * du graphe AST (qui reste pertinent), sans attendre.
+ */
+let rerankerHealthy = false;
+let rerankerHealthCheckedAt = 0;
+let rerankerHealthInflight: Promise<void> | null = null;
+const RERANKER_HEALTH_TTL_MS = 10_000;
+
+const refreshRerankerHealth = async (): Promise<void> => {
+  if (rerankerHealthInflight) return rerankerHealthInflight;
+  const now = Date.now();
+  if (now - rerankerHealthCheckedAt < RERANKER_HEALTH_TTL_MS) return;
+  rerankerHealthCheckedAt = now;
+  rerankerHealthInflight = (async () => {
+    try {
+      rerankerHealthy = await checkRerankerHealth();
+    } catch {
+      rerankerHealthy = false;
+    } finally {
+      rerankerHealthInflight = null;
+    }
+  })();
+  return rerankerHealthInflight;
 };
 
 const rerankCandidates = async (
@@ -640,6 +702,13 @@ const rerankCandidates = async (
   candidates: RerankCandidate[],
 ): Promise<{ candidates: RerankCandidate[]; rerankTime: number; rerankFallback: boolean }> => {
   if (candidates.length === 0) return { candidates: [], rerankTime: 0, rerankFallback: false };
+
+  // Rafraîchissement non bloquant : on lit l'état connu, la vérification se fait
+  // en arrière-plan pour les requêtes suivantes.
+  refreshRerankerHealth();
+  if (!rerankerHealthy) {
+    return { candidates, rerankTime: 0, rerankFallback: true };
+  }
 
   console.log(`[Aether] Reranking ${candidates.length} candidates...`);
   const rerankStartTime = Date.now();
@@ -650,10 +719,12 @@ const rerankCandidates = async (
     // Explicit fallback: return candidates in their original retrieval order
     // (BM25 for RAG, graph-score for AST). The caller will surface the warning.
     console.warn(`[Aether] ⚠️  Reranker fallback active: ${rerankResponse.reason}`);
+    rerankerHealthy = false;
+    rerankerHealthCheckedAt = Date.now();
     return { candidates, rerankTime, rerankFallback: true };
   }
 
-  const SCORE_THRESHOLD = 0.3;
+  const SCORE_THRESHOLD = 0.05;
   const MIN_CANDIDATES = 2;
 
   const scored = rerankResponse.results
@@ -672,40 +743,35 @@ const rerankCandidates = async (
     ? scored.filter(c => c.score >= SCORE_THRESHOLD)
     : scored.slice(0, MIN_CANDIDATES);
 
+  console.log(`[Aether] Rerank survival: ${finalCandidates.length}/${candidates.length} chunks (threshold=${SCORE_THRESHOLD})`);
   return { candidates: finalCandidates, rerankTime, rerankFallback: false };
 };
 
 const buildTieredBudgetChunks = async (
-  chunks: Awaited<ReturnType<typeof extractForTask>>,
+  chunks: ASTChunk[],
   activeFilePath: string | undefined,
+  ideFiles: string[],
   finalCandidates: RerankCandidate[],
-): Promise<BudgetChunk[]> => {
-  const budgetChunks: BudgetChunk[] = [];
+): Promise<{ astChunks: BudgetChunk[]; ragChunks: BudgetChunk[] }> => {
+  const astChunks: BudgetChunk[] = [];
+  const ragChunks: BudgetChunk[] = [];
 
+  // ─── Tier 1: Active File ──────────────────────────────────────────────────
   if (activeFilePath) {
-    const activeChunk = Array.from(graph?.nodes.values() ?? []).find((chunk) =>
-      chunk.filePath.endsWith(activeFilePath) || activeFilePath.endsWith(chunk.filePath)
-    );
+    const content = getFullFileContent(activeFilePath);
+    if (content) {
+      const astNodes = Array.from(graph?.nodes.values() ?? []);
+      const activeChunk = astNodes.find((c) => c.filePath === activeFilePath);
+      
+      const requiredChunks: BudgetChunk["requiredChunks"] = [];
+      if (activeChunk) {
+        for (const dep of activeChunk.imports) {
+          const depPath = astNodes.find(n => n.filePath.endsWith(dep) || dep.endsWith(n.filePath))?.filePath;
+          if (depPath) requiredChunks.push({ id: `sig_${depPath}`, depthHint: "sig" });
+        }
+      }
 
-    if (activeChunk) {
-      const content = getFullFileContent(activeChunk.filePath);
-      // Resolve AST-level imports of the active file as requiredChunks so the
-      // dependency-aware knapsack can pull them in with the correct depthHint.
-      const resolvedDeps = graph?.edges.get(activeChunk.filePath) ?? [];
-      const requiredChunks = resolvedDeps
-        .map((depPath) => {
-          const depChunk = graph?.nodes.get(depPath);
-          if (!depChunk) return null;
-          // Determine depth hint: concrete functions → full, contracts → sig
-          const hasConcreteExports = depChunk.functions.some((f) => f.isExported);
-          return {
-            id: depChunk.filePath,
-            depthHint: (hasConcreteExports ? "full" : "sig") as "full" | "sig",
-          };
-        })
-        .filter((d): d is { id: string; depthHint: "full" | "sig" } => d !== null);
-
-      budgetChunks.push({
+      astChunks.push({
         id: "active_file_full",
         text: `// ACTIVE FILE: ${activeFilePath}\n${content}`,
         tokens: await estimateTokens(content),
@@ -715,10 +781,37 @@ const buildTieredBudgetChunks = async (
     }
   }
 
+  // ─── Tier 2: Surgical IDE Files ───────────────────────────────────────────
+  for (const ideFile of ideFiles) {
+    if (ideFile === activeFilePath) continue;
+
+    const ideChunk = Array.from(graph?.nodes.values() ?? []).find((chunk) =>
+      chunk.filePath.endsWith(ideFile) || ideFile.endsWith(chunk.filePath)
+    );
+
+    if (ideChunk) {
+      const content = [
+        `// SURGICAL CONTEXT (IDE File): ${ideFile}`,
+        ...ideChunk.types.map(t => t.body),
+        ...ideChunk.functions.map(f => 
+          `${f.isExported ? 'export ' : ''}${f.isAsync ? 'async ' : ''}function ${f.name}(${f.params})${f.returnType ? `: ${f.returnType}` : ''}`
+        ),
+      ].join("\n");
+      
+      astChunks.push({
+        id: `ide_file_surgical_${Buffer.from(ideFile).toString('base64').slice(0, 8)}`,
+        text: content,
+        tokens: await estimateTokens(content),
+        score: 1500,
+      });
+    }
+  }
+
+  // ─── Tier 3: RAG Candidates ───────────────────────────────────────────────
   const top3 = finalCandidates.slice(0, 3);
   for (const candidate of top3) {
     const content = getFullFileContent(candidate.filePath);
-    budgetChunks.push({
+    ragChunks.push({
       id: `high_fid_${candidate.id}`,
       text: `// ${path.basename(candidate.filePath)} (Full Context)\n${content}`,
       tokens: await estimateTokens(content),
@@ -727,15 +820,15 @@ const buildTieredBudgetChunks = async (
   }
 
   for (const candidate of finalCandidates.slice(3, 15)) {
-    budgetChunks.push({
+    ragChunks.push({
       id: candidate.id,
       text: candidate.text,
       tokens: await estimateTokens(candidate.text),
-      score: candidate.score * 10,
+      score: candidate.score,
     });
   }
 
-  return budgetChunks;
+  return { astChunks, ragChunks };
 };
 
 const buildContextResponse = async (
@@ -744,12 +837,17 @@ const buildContextResponse = async (
   finalCandidates: RerankCandidate[],
   classification: ClassificationResult,
   activeFilePath: string | undefined,
+  ideFiles: string[],
   rerankTime: number,
   rerankFallback: boolean,
+  ragDegraded: boolean,
+  ragReason: string | undefined,
 ): Promise<string> => {
-  const budgetChunks = await buildTieredBudgetChunks(chunks, activeFilePath, finalCandidates);
-  const budgetResult = await applyBudget(classification.budgetTokens, budgetChunks, []);
+  const { astChunks, ragChunks } = await buildTieredBudgetChunks(chunks, activeFilePath, ideFiles, finalCandidates);
+  const budgetResult = await applyBudget(classification.budgetTokens, astChunks, ragChunks);
   const reasoning = classification.requiresThinking ? "think" : "no_think";
+  console.log(`[Aether] Budget used: AST=${budgetResult.budgetUsed.ast} tok, RAG=${budgetResult.budgetUsed.rag} tok`);
+  console.log(`[Aether] Final context lengths: AST=${budgetResult.astContext.length} chars, RAG=${budgetResult.ragContext.length} chars`);
 
   return JSON.stringify({
     id: msg.id,
@@ -769,7 +867,11 @@ const buildContextResponse = async (
         rerankTime,
         taskType: classification.taskType,
         classifierConfidence: classification.confidence,
-        rerankFallback, // ← surface to IDE/Gateway for user warning
+        rerankFallback,
+        // Indisponibilité de l'index/embeddings : le client doit pouvoir le signaler
+        // au lieu de croire à une absence de résultats pertinents.
+        ragDegraded,
+        ragReason,
       },
     },
   });
@@ -782,13 +884,17 @@ const handleContextRequest = async (msg: any): Promise<string> => {
 
   const taskText: string = msg.payload.taskText ?? "";
   const activeFilePath: string | undefined = msg.payload.activeFilePath;
+  const ideFiles: string[] = msg.payload.ideFiles ?? [];
 
   // ── 1. Classify the task to derive dynamic budget & thinking mode ──────────
   const classification = classifyTask(taskText);
   // Respect an explicit budget override from the IDE (e.g. user slider), but
   // never go below the classifier's recommendation.
   const requestedBudget: number = msg.payload.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
-  const effectiveBudget = Math.min(requestedBudget, classification.budgetTokens);
+  // Plancher abaissé de 8 000 à 2 048 : le contexte volatil est repayé à chaque
+  // tour (il change), et le préfill coûte ~3,6 ms/token sur cette machine.
+  const classifierBudget = Math.max(2048, classification.budgetTokens);
+  const effectiveBudget = Math.min(requestedBudget, classifierBudget);
   const effectiveClassification: ClassificationResult = {
     ...classification,
     budgetTokens: effectiveBudget,
@@ -809,9 +915,14 @@ const handleContextRequest = async (msg: any): Promise<string> => {
   // ── 3. Context extraction ─────────────────────────────────────────────────
   const chunks = extractForTask(taskText, graph);
 
+  const rag = await buildRagCandidates(taskText);
+  if (rag.degraded) {
+    console.warn(`[Aether] ⚠️  RAG dégradé : ${rag.reason ?? "raison inconnue"}`);
+  }
+
   const candidates = [
     ...buildAstCandidates(chunks, activeFilePath).slice(0, MAX_AST_RERANK_CANDIDATES),
-    ...(await buildRagCandidates(taskText)).slice(0, MAX_RAG_RERANK_CANDIDATES),
+    ...rag.candidates.slice(0, MAX_RAG_RERANK_CANDIDATES),
   ];
 
   // ── 4. Reranking (with explicit fallback handling) ─────────────────────────
@@ -819,7 +930,8 @@ const handleContextRequest = async (msg: any): Promise<string> => {
 
   // ── 5. Build response ─────────────────────────────────────────────────────
   const response = await buildContextResponse(
-    msg, chunks, reranked, effectiveClassification, activeFilePath, rerankTime, rerankFallback
+    msg, chunks, reranked, effectiveClassification, activeFilePath, ideFiles,
+    rerankTime, rerankFallback, rag.degraded, rag.reason,
   );
 
   // ── 6. Cache & telemetry ──────────────────────────────────────────────────
@@ -856,6 +968,18 @@ const handleRequest = async (raw: string): Promise<string> => {
      if (msg.type === "context:request" && graph) {
        return handleContextRequest(msg)
        }
+     // Repo-map par signatures : bloc *stable* destiné au préfixe du prompt.
+     // Il change uniquement quand le code change, pas à chaque requête.
+     if (msg.type === "repo:map" && graph) {
+       const tokenBudget = Number.parseInt(String(msg.payload?.tokenBudget ?? 1500), 10)
+       const map = buildRepoMap(graph, { tokenBudget })
+       return JSON.stringify({
+         id: msg.id,
+         type: "repo:map:response",
+         ts: Date.now(),
+         payload: map,
+       })
+       }
      return JSON.stringify({ id: msg.id, type: "error", payload: { message: "unknown" } })
     } catch (err: any) {
      console.error("[Daemon] Request Error:", err)
@@ -865,11 +989,16 @@ const handleRequest = async (raw: string): Promise<string> => {
 
 const startServer = async () => {
   await initReranker();
-   const rerankerHealthy = await checkRerankerHealth();
-   console.log(`[Aether] Reranker health at startup: ${rerankerHealthy ? "✅ OK" : "⚠️  unavailable"}`);
-   if (!rerankerHealthy) {
-     console.warn("[Aether] Start the Python reranker server to enable surgical reranking.");
-     }
+
+  // Sonde de santé NON bloquante. Le démarrage du daemon ne doit pas être
+  // retardé par le chargement à froid du cross-encoder : le socket doit être
+  // disponible immédiatement, et les requêtes retombent sur l'ordre du graphe
+  // AST tant que le reranker n'est pas prêt.
+  rerankerHealthCheckedAt = 0;
+  await refreshRerankerHealth();
+  console.log(
+    `[Aether] Reranker health at startup: ${rerankerHealthy ? "✅ OK" : "⚠️  indisponible (repli sur l'ordre AST, sondage en tâche de fond)"}`,
+  );
    startTTLCleanup()
    
    if (fs.existsSync(SOCK_PATH)) fs.unlinkSync(SOCK_PATH)
@@ -929,7 +1058,7 @@ const startWatcher = () => {
   fs.watch(PROJECT_ROOT, { recursive: true }, (event, filename) => {
     if (!filename) return;
     // Basic filtering
-    if (!filename.endsWith(".ts") && !filename.endsWith(".tsx")) return;
+    if (!INDEXED_EXTENSIONS.some((ext) => filename.endsWith(ext))) return;
     if (filename.includes("node_modules") || filename.includes("dist") || filename.includes(".git") || filename.includes(".aether")) return;
 
     const fullPath = path.join(PROJECT_ROOT, filename);

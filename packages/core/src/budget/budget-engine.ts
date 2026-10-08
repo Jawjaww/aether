@@ -160,20 +160,45 @@ export const applyBudget = async (
     return true;
   };
 
-  // AST pass with dependency pulling
-  for (const chunk of sortedAst) {
-    if (!trySelect(chunk, selectedAst, true)) continue;
+  // --- 1. Réserve RAG (30 % du budget total) ---
+  //
+  // Bug corrigé : `trySelect` testait `remaining`, c'est-à-dire le budget TOTAL.
+  // L'AST pouvait donc consommer 100 % du budget et affamer complètement le RAG ;
+  // `astBudget` n'était utilisé que dans une branche quasi morte. La passe AST est
+  // désormais réellement bornée, et la réserve RAG est effective.
+  const ragReserve = Math.floor(tokenBudget * 0.3);
+  const astBudget = tokenBudget - ragReserve;
 
-    // Pull required dependencies immediately after selecting the parent
-    for (const dep of chunk.requiredChunks ?? []) {
-      const depChunk = allChunksById.get(dep.id);
-      if (depChunk) trySelect(depChunk, selectedAst, true);
+  /** Passe AST bornée par `limit` tokens, dépendances incluses si elles tiennent. */
+  const astPass = (limit: number): void => {
+    for (const chunk of sortedAst) {
+      if (astTokensUsed + chunk.tokens > limit) continue;
+      trySelect(chunk, selectedAst, true);
+
+      for (const dep of chunk.requiredChunks ?? []) {
+        const depChunk = allChunksById.get(dep.id);
+        if (!depChunk) continue;
+        if (astTokensUsed + depChunk.tokens <= limit) {
+          trySelect(depChunk, selectedAst, true);
+        }
+      }
     }
-  }
+  };
 
-  // RAG pass (no dependency pulling needed — RAG chunks are self-contained)
+  astPass(astBudget);
+
+  // --- 2. Passe RAG : la réserve de 30 % + ce que l'AST n'a pas consommé ---
+  remaining = tokenBudget - astTokensUsed;
   for (const chunk of sortedRag) {
     trySelect(chunk, selectedRag, false);
+  }
+
+  // --- 3. « Use it or lose it » ---
+  // Si le RAG n'a pas rempli sa réserve (peu de candidats, ou chunks trop gros),
+  // l'AST récupère la place au lieu de la laisser vide. Sans cette passe, un gros
+  // chunk AST utile était écarté alors que personne ne consommait le budget.
+  if (ragTokensUsed < ragReserve) {
+    astPass(tokenBudget - ragTokensUsed);
   }
 
   return {
